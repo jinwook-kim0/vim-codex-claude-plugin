@@ -25,20 +25,25 @@ import threading
 import time
 
 from .transport import RPC
+from .permissions import WRITE_PROBE
 
-INSTRUCTIONS = """You are connected to Vim. The live Vim buffer is authoritative, including
-unsaved changes and unnamed buffers. Before reading or editing code, use the
-vim_buffers MCP tools. Read the latest buffer and use its changedtick in every
-edit. Modify source files through Vim buffers, never save them directly. Open
-other files, including files outside the project, with read_buffer, then edit
-them in Vim. Global skills, their supporting files, and the user's configured
-MCP tools are available. You may use shell tools to read files, run skill
-scripts, and inspect the environment under the configured permission policy.
-Do not use shell commands or built-in patch tools to bypass Vim for source
-edits, or change permission settings yourself. List modified buffers in
-your answer. A stale edit must be recalculated from a fresh read, never forced.
-External tests see saved files, not unsaved buffer edits; explain this when relevant.
-For CLI questions without inline context, call editor_context first.
+INSTRUCTIONS = """You are connected to Vim. Use list_buffers to distinguish loaded source
+buffers (including hidden buffers) from files that are not open in Vim.
+For an open buffer, its current contents are authoritative, including unsaved
+edits. Use read_buffer and edit_buffer with a fresh changedtick; never bypass
+the buffer by changing its disk file. Stale edits must be recalculated.
+For a new file or a file not open in Vim, use normal Codex filesystem/shell
+tools under the session's current permissions. Do not load it into Vim merely
+to read, create, or modify it. Buffer tools deliberately reject unopened files.
+When a next step such as testing requires an edited open buffer on disk, call
+save_buffer with its current changedtick and explain the reason. It saves
+automatically if current permissions allow; otherwise it requests permission
+when the policy permits asking. Wait for successful save before running tests;
+if save is declined, blocked, or stale, do not claim validation used the edit.
+Unnamed buffers need a filename chosen by the user before saving.
+Global skills, shell tools, and the user's configured MCP tools remain available.
+Do not change permission settings yourself. List edited files/buffers and any
+saves in your answer. For CLI questions without inline context, call editor_context first.
 """
 
 
@@ -155,17 +160,18 @@ def tool(name, description, properties, required=()):
     return {'name': name, 'description': description,
             'inputSchema': {'type': 'object', 'properties': properties,
                             'required': list(required), 'additionalProperties': False},
-            'annotations': {'readOnlyHint': name != 'edit_buffer',
+            'annotations': {'readOnlyHint': name not in ('edit_buffer', 'save_buffer'),
                             'destructiveHint': False, 'openWorldHint': False}}
 
 
 TARGET = {'buffer_id': {'type': 'integer', 'description': 'Vim buffer number, when known.'},
-          'path': {'type': 'string', 'description': 'Absolute or workspace-relative path to load into Vim, including outside the project.'}}
+          'path': {'type': 'string', 'description': 'Absolute or workspace-relative path of an already loaded Vim buffer.'}}
 TOOLS = [
     tool('editor_context', 'Read current Vim editor context, cursor, selection, and unsaved contents.', {}),
     tool('list_buffers', 'List accessible source buffers and their changedticks in the connected Vim.', {}),
-    tool('read_buffer', 'Read the latest live buffer. Loads another file into Vim if necessary. '
-         'Use returned changedtick for edits; disk content is never preferred over an existing buffer.', TARGET),
+    tool('read_buffer', 'Read an already loaded Vim buffer, including unsaved edits. '
+         'Never opens files. For an unopened file, use normal Codex file tools. '
+         'Use returned changedtick for edits and saves.', TARGET),
     tool('edit_buffer', 'Replace a 1-based inclusive line range in a Vim buffer without saving. '
          'Insert before start_line by setting end_line=start_line-1. Use a fresh read changedtick. '
          'Changes are undoable in Vim. Never retry stale edits without re-reading.',
@@ -174,6 +180,11 @@ TOOLS = [
           'end_line': {'type': 'integer', 'minimum': 0},
           'lines': {'type': 'array', 'items': {'type': 'string'}}},
          ('expected_tick', 'start_line', 'end_line', 'lines')),
+    tool('save_buffer', 'Save a named, already loaded Vim buffer when a next step needs it on disk. '
+         'Checks live Codex write permissions; requests approval only if needed and permitted. '
+         'Rejects stale buffers or changed disk files. Wait for success before testing.',
+         {**TARGET, 'expected_tick': {'type': 'integer'},
+          'reason': {'type': 'string', 'minLength': 1}}, ('expected_tick', 'reason')),
 ]
 
 
@@ -189,7 +200,10 @@ class BufferHandler(socketserver.StreamRequestHandler):
             data = json.loads(self.rfile.readline(8 * 1024 * 1024))
             if not secrets.compare_digest(str(data.get('token', '')), self.server.host.token):
                 raise ValueError('Invalid Vim connection token')
-            reply = self.server.host.buffer_request(data['operation'], data.get('arguments', {}), data['root'])
+            if data['operation'] == 'save_buffer':
+                reply = self.server.host.save_buffer(data.get('arguments', {}), data['root'], data.get('session_key'))
+            else:
+                reply = self.server.host.buffer_request(data['operation'], data.get('arguments', {}), data['root'])
             value = {'result': reply}
         except Exception as error:
             value = {'error': str(error)}
@@ -247,6 +261,9 @@ class Host:
         self.buffer_pending = {}
         self.buffer_lock = threading.Lock()
         self.interactive_pending = {}
+        self.tool_sessions = {}
+        self.save_grants = {}
+        self.save_locks = {}
         self.server_lock = threading.Lock()
         self.operation_locks = {}
         self.contexts = {}
@@ -309,8 +326,9 @@ class Host:
             argv = [self.config['codex'], 'app-server', '--listen', 'unix://' + str(endpoint)]
             # Retain normal skill, shell, plugin and MCP availability. Source
             # edits still go through Vim; permission requests are shown in Vim.
-            overrides = {'sandbox_mode': self.config.get('sandbox_mode', 'read-only'),
-                         'approval_policy': self.config.get('approval_policy', 'on-request')}
+            overrides = {key: value for key, value in {
+                'sandbox_mode': self.config.get('sandbox_mode'),
+                'approval_policy': self.config.get('approval_policy')}.items() if value}
             for key, value in overrides.items():
                 argv += ['-c', key + '=' + json.dumps(value)]
             argv += self.config.get('extra_args', [])
@@ -371,13 +389,108 @@ class Host:
                 pending[1].update(message)
                 pending[0].set()
 
-    def thread_config(self, root):
+    def current_permissions(self, thread_id):
+        # Read live thread settings without applying startup overrides. This
+        # observes /permissions changes made in the native CLI after opening.
+        reply = self.rpc.call('thread/resume', {'threadId': thread_id, 'excludeTurns': True})
+        if 'sandbox' not in reply or 'approvalPolicy' not in reply:
+            raise RuntimeError('Codex did not return the current save permissions')
+        return {key: reply.get(key) for key in
+                ('sandbox', 'approvalPolicy', 'activePermissionProfile', 'approvalsReviewer', 'cwd')}
+
+    def write_allowed(self, path, permissions):
+        profile = permissions.get('activePermissionProfile') or {}
+        custom_profile = bool(profile.get('id') and not profile['id'].startswith(':'))
+        if permissions['sandbox'].get('type') == 'readOnly' and not custom_profile:
+            return False
+        params = {'command': [self.config['python'], '-c', WRITE_PROBE, path],
+                  'cwd': permissions['cwd'], 'timeoutMs': 15000}
+        if custom_profile:
+            params['permissionProfile'] = profile['id']
+        else:
+            params['sandboxPolicy'] = permissions['sandbox']
+        result = self.rpc.call('command/exec', params)
+        if result.get('exitCode') != 0:
+            raise RuntimeError('Could not check Codex write permission: ' + result.get('stderr', '')[-1500:])
+        probe = json.loads(result['stdout'])
+        if probe['path'] != path:
+            raise RuntimeError('Save target changed during the permission check')
+        if not probe['allowed'] and not probe.get('permission_denied'):
+            raise RuntimeError('Cannot save this path: ' + probe.get('message', 'write probe failed'))
+        return probe['allowed']
+
+    def request_save_permission(self, path, reason):
+        request_id = secrets.token_hex(12)
+        event, slot = threading.Event(), {}
+        with self.buffer_lock:
+            self.interactive_pending[request_id] = (event, slot)
+        try:
+            self.emit({'event': 'approval_request', 'request_id': request_id,
+                       'method': 'vim/save_buffer',
+                       'params': {'reason': reason, 'command': 'Save Vim buffer: ' + path}})
+            event.wait()
+            return slot.get('decision', 'decline')
+        finally:
+            with self.buffer_lock:
+                self.interactive_pending.pop(request_id, None)
+
+    def save_buffer(self, arguments, root, session_key):
+        session = self.tool_sessions.get(session_key)
+        if not session or session[0] != root:
+            raise ValueError('Save request is not bound to a Codex session')
+        if type(arguments.get('expected_tick')) is not int or not isinstance(arguments.get('reason'), str) or not arguments['reason'].strip():
+            raise ValueError('Saving requires expected_tick and a reason')
+        target = {key: arguments[key] for key in ('buffer_id', 'path') if key in arguments}
+        info = self.buffer_request('read_buffer', target, root)
+        if info['changedtick'] != arguments['expected_tick']:
+            raise ValueError('Stale buffer: read it again before saving')
+        if info.get('disk_changed'):
+            raise ValueError('File changed on disk; reconcile before saving')
+        if not info.get('path'):
+            raise ValueError('Unnamed buffer: ask the user to choose a filename before saving')
+        if not info.get('modified', True) and info.get('on_disk'):
+            return dict(info, saved=True, already_saved=True)
+        path = os.path.realpath(info['path'])
+        with self.server_lock:
+            lock = self.save_locks.setdefault(path, threading.Lock())
+        with lock:
+            permissions = self.current_permissions(session[1])
+            fingerprint = json.dumps(permissions, sort_keys=True)
+            grant_key = (session[1], path)
+            if grant_key in self.save_grants and self.save_grants[grant_key] != fingerprint:
+                self.save_grants.pop(grant_key)
+            granted = self.save_grants.get(grant_key) == fingerprint
+            if not granted:
+                granted = self.write_allowed(path, permissions)
+            decision = None
+            if not granted:
+                policy = permissions['approvalPolicy']
+                may_ask = policy in ('on-request', 'untrusted') if isinstance(policy, str) else bool(
+                    policy.get('granular', {}).get('sandbox_approval', False))
+                if not may_ask:
+                    raise PermissionError('Current Codex permissions deny saving and do not allow a prompt')
+                decision = self.request_save_permission(path, arguments['reason'])
+                if decision not in ('accept', 'acceptForSession'):
+                    raise PermissionError('Buffer save declined; disk is unchanged. Do not validate the unsaved edit.')
+            if json.dumps(self.current_permissions(session[1]), sort_keys=True) != fingerprint:
+                raise PermissionError('Codex permissions changed while saving; retry under the new settings')
+            # Vim rechecks changedtick, disk conflicts, target identity and its
+            # own write options, then performs a normal :write with user hooks.
+            result = self.buffer_request('save_buffer', {
+                'buffer_id': info['buffer_id'], 'expected_tick': arguments['expected_tick'],
+                'authorized_path': path}, root)
+            if decision == 'acceptForSession':
+                self.save_grants[grant_key] = fingerprint
+            return result
+
+    def thread_config(self, root, session_key=None):
         server = {
             'command': self.config['python'],
             'args': [self.config['script'], 'mcp'],
             'env': {'VIM_CODEX_PORT': str(self.buffer_server.server_address[1]),
-                    'VIM_CODEX_TOKEN': self.token, 'VIM_CODEX_ROOT': root},
-            'enabled': True, 'required': True,
+                    'VIM_CODEX_TOKEN': self.token, 'VIM_CODEX_ROOT': root,
+                    'VIM_CODEX_SESSION': session_key or ''},
+            'enabled': True, 'required': True, 'tool_timeout_sec': 600,
         }
         # A dotted override adds only our server, preserving global MCP config
         # including optional values and credentials without round-tripping it.
@@ -433,9 +546,13 @@ class Host:
                 raise ValueError('Session does not belong to this project/mode')
             self.catalog.choose(root, mode, current)
             return current
-        params = {'cwd': root, 'approvalPolicy': self.config.get('approval_policy', 'on-request'),
-                  'sandbox': self.config.get('sandbox_mode', 'read-only'),
-                  'developerInstructions': INSTRUCTIONS, 'config': self.thread_config(root)}
+        session_key = secrets.token_hex(24)
+        params = {'cwd': root, 'developerInstructions': INSTRUCTIONS,
+                  'config': self.thread_config(root, session_key)}
+        if self.config.get('sandbox_mode'):
+            params['sandbox'] = self.config['sandbox_mode']
+        if self.config.get('approval_policy'):
+            params['approvalPolicy'] = self.config['approval_policy']
         if self.config.get('model'):
             params['model'] = self.config['model']
         if current:
@@ -469,6 +586,7 @@ class Host:
             self.rpc.call('thread/name/set', {'threadId': thread_id,
                 'name': 'Vim ' + mode + ': ' + (Path(root).name or root)})
         self.loaded[thread_id] = (root, mode)
+        self.tool_sessions[session_key] = (root, thread_id)
         self.catalog.add(root, mode, thread_id)
         if current and imported_title is not None:
             self.catalog.update(thread_id, title=imported_title)
@@ -529,8 +647,7 @@ class Host:
                 self.turns[thread_id] = ''
                 try:
                     response = self.rpc.call('turn/start', {'threadId': thread_id,
-                        'input': [{'type': 'text', 'text': text}],
-                        'approvalPolicy': self.config.get('approval_policy', 'on-request')})
+                        'input': [{'type': 'text', 'text': text}]})
                 except Exception:
                     self.turns.pop(thread_id, None)
                     self.emit({'event': 'answer_done', 'root': root, 'mode': mode,
@@ -626,8 +743,10 @@ def mcp_main():
                 if params['name'] not in {t['name'] for t in TOOLS}:
                     raise ValueError('Unknown buffer tool')
                 request = {'token': os.environ['VIM_CODEX_TOKEN'], 'root': os.environ['VIM_CODEX_ROOT'],
+                           'session_key': os.environ.get('VIM_CODEX_SESSION'),
                            'operation': params['name'], 'arguments': params.get('arguments', {})}
-                with socket.create_connection(('127.0.0.1', int(os.environ['VIM_CODEX_PORT'])), timeout=30) as stream:
+                timeout = 600 if params['name'] == 'save_buffer' else 30
+                with socket.create_connection(('127.0.0.1', int(os.environ['VIM_CODEX_PORT'])), timeout=timeout) as stream:
                     stream.sendall((json.dumps(request) + '\n').encode())
                     reply = json.loads(stream.makefile('rb').readline(16 * 1024 * 1024))
                 if 'error' in reply:

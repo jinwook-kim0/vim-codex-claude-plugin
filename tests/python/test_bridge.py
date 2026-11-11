@@ -163,7 +163,7 @@ class HostTests(unittest.TestCase):
         replies = [json.loads(x) for x in result.stdout.splitlines()]
         self.assertEqual(2, len(replies))
         self.assertEqual('2024-11-05', replies[0]['result']['protocolVersion'])
-        self.assertEqual({'editor_context', 'read_buffer', 'edit_buffer', 'list_buffers'},
+        self.assertEqual({'editor_context', 'read_buffer', 'edit_buffer', 'save_buffer', 'list_buffers'},
                          {t['name'] for t in replies[1]['result']['tools']})
 
     def external_thread(self, cwd=None, source='cli', title='CLI conversation', updated=100, parent=None):

@@ -43,8 +43,25 @@ call assert_equal(['unsaved first', 'user typing'], getline(1, '$'))
 redo
 call assert_equal(['replacement'], getline(1, '$'))
 
-" Open and edit another file without replacing the current source or saving.
+" Unopened files are left to native Codex tools, never imported by a read.
 call writefile(['other disk'], s:temp . '/other.txt')
+let s:count = len(getbufinfo())
+try
+  call codex#BufferRequest('read_buffer', {'path': 'other.txt'}, s:temp)
+  call assert_report('unopened file was imported into Vim')
+catch /not open in Vim/
+endtry
+call assert_equal(s:count, len(getbufinfo()))
+try
+  call codex#BufferRequest('edit_buffer', {'path': 'new.txt', 'expected_tick': 0,
+        \ 'start_line': 1, 'end_line': 0, 'lines': ['new file']}, s:temp)
+  call assert_report('new file was imported into Vim')
+catch /not open in Vim/
+endtry
+call assert_equal(s:count, len(getbufinfo()))
+" A user-opened hidden buffer is editable without moving focus or saving.
+let s:other_nr = bufadd(s:temp . '/other.txt')
+call bufload(s:other_nr)
 let s:other = codex#BufferRequest('read_buffer', {'path': 'other.txt'}, s:temp)
 let s:window = win_getid()
 call codex#BufferRequest('edit_buffer', {'buffer_id': s:other.buffer_id, 'expected_tick': s:other.changedtick,
@@ -76,6 +93,7 @@ endfor
 let g:codex_access_scope = 'global'
 let s:outside = tempname()
 call writefile(['outside original'], s:outside)
+call bufload(bufadd(s:outside))
 let s:outside_read = codex#BufferRequest('read_buffer', {'path': s:outside}, s:temp)
 call codex#BufferRequest('edit_buffer', {'buffer_id': s:outside_read.buffer_id,
       \ 'expected_tick': s:outside_read.changedtick, 'start_line': 1, 'end_line': 1,
@@ -84,6 +102,52 @@ call assert_equal(['outside unsaved'], getbufline(s:outside_read.buffer_id, 1, '
 call assert_equal(['outside original'], readfile(s:outside))
 call assert_true(index(map(codex#BufferRequest('list_buffers', {}, s:temp), 'v:val.buffer_id'), s:outside_read.buffer_id) >= 0)
 call delete(s:outside)
+
+" Save uses Vim's normal write path and keeps undo, encoding and source focus.
+execute 'hide buffer ' . s:nr
+let s:read = codex#BufferRequest('read_buffer', {'buffer_id': s:nr}, s:temp)
+let s:save = codex#BufferRequest('save_buffer', {'buffer_id': s:nr,
+      \ 'expected_tick': s:read.changedtick, 'authorized_path': s:read.path}, s:temp)
+call assert_true(s:save.saved)
+call assert_equal(['replacement'], readfile(s:temp . '/source.txt'))
+call assert_false(&modified)
+undo
+call assert_equal(['unsaved first', 'user typing'], getline(1, '$'))
+redo
+call assert_equal(['replacement'], getline(1, '$'))
+
+" A save may not overwrite user edits made during permission confirmation.
+let s:read = codex#BufferRequest('read_buffer', {'buffer_id': s:nr}, s:temp)
+call setline(1, 'typing while waiting')
+try
+  call codex#BufferRequest('save_buffer', {'buffer_id': s:nr,
+        \ 'expected_tick': s:read.changedtick, 'authorized_path': s:read.path}, s:temp)
+  call assert_report('stale save was accepted')
+catch /Stale buffer/
+endtry
+call assert_equal(['replacement'], readfile(s:temp . '/source.txt'))
+
+" External disk edits cannot be silently replaced, even when save is allowed.
+call writefile(['external process'], s:temp . '/source.txt')
+let s:read = codex#BufferRequest('read_buffer', {'buffer_id': s:nr}, s:temp)
+call assert_true(s:read.disk_changed)
+try
+  call codex#BufferRequest('save_buffer', {'buffer_id': s:nr,
+        \ 'expected_tick': s:read.changedtick, 'authorized_path': s:read.path}, s:temp)
+  call assert_report('external disk edit was overwritten')
+catch /changed on disk/
+endtry
+call assert_equal(['external process'], readfile(s:temp . '/source.txt'))
+
+" Unloading a buffer makes it a normal disk file again.
+execute 'silent bunload! ' . s:other_nr
+call assert_false(bufloaded(s:other_nr))
+try
+  call codex#BufferRequest('read_buffer', {'buffer_id': s:other_nr}, s:temp)
+  call assert_report('unloaded buffer was implicitly loaded')
+catch /not open in a source buffer/
+endtry
+call assert_false(bufloaded(s:other_nr))
 
 " Exact multibyte character selection, coordinates, and full unnamed buffer.
 enew!

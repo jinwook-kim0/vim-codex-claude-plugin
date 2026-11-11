@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socketserver
@@ -79,7 +80,21 @@ class Handler(socketserver.BaseRequestHandler):
             self.notify('turn/started', {'threadId': thread_id, 'turn': {'id': turn_id}})
             if 'SLOW' in text:
                 return
-            if 'REQUEST_APPROVAL' in text:
+            if 'SAVE_BUFFER' in text or 'SAVE_CONFIRM' in text:
+                buffer_id = int(re.search(r'buffer=(\d+)', text).group(1))
+                read = self.tool(thread_id, 'read_buffer', {'buffer_id': buffer_id})
+                confirm = 'SAVE_CONFIRM' in text
+                edited = self.tool(thread_id, 'edit_buffer', {'buffer_id': buffer_id,
+                    'expected_tick': read['changedtick'], 'start_line': 1, 'end_line': 1,
+                    'lines': ['unsaved validation edit' if confirm else 'saved by fixture']})
+                if confirm:
+                    self.threads[thread_id]['sandbox'] = 'read-only'
+                saved = self.tool(thread_id, 'save_buffer', {'buffer_id': buffer_id,
+                    'expected_tick': edited['changedtick'], 'reason': 'Save before running validation'})
+                if not saved.get('saved'):
+                    raise RuntimeError('Save did not finish; validation was not run')
+                answer = 'Saved for validation'
+            elif 'REQUEST_APPROVAL' in text:
                 request_id = 'permission-' + turn_id
                 event, slot = threading.Event(), {}
                 self.approvals[request_id] = (event, slot)
@@ -128,7 +143,15 @@ class Handler(socketserver.BaseRequestHandler):
                 elif method in ('thread/start', 'thread/resume'):
                     thread_id = params.get('threadId', str(uuid.uuid4()))
                     self.threads.setdefault(thread_id, {}).update(params)
-                    result = {'thread': {'id': thread_id}}
+                    p = self.threads[thread_id]
+                    mode = p.get('sandbox', 'workspace-write')
+                    result = {'thread': {'id': thread_id}, 'cwd': p.get('cwd'),
+                        'sandbox': {'type': {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite',
+                                             'danger-full-access': 'dangerFullAccess'}[mode]},
+                        'approvalPolicy': p.get('approvalPolicy', 'on-request'), 'approvalsReviewer': 'user'}
+                elif method == 'command/exec':
+                    result = {'exitCode': 0, 'stdout': json.dumps({'allowed': True,
+                              'path': params['command'][-1]}), 'stderr': ''}
                 elif method == 'thread/name/set':
                     self.threads[params['threadId']]['fixtureName'] = params['name']
                     result = {}

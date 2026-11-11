@@ -92,9 +92,32 @@ with tempfile.TemporaryDirectory(prefix='vim-codex-native-test-') as directory:
         buffer_server = next(s for s in status['data'] if s['name'] == 'vim_buffers')
         assert buffer_server['runtimeStatus'] == 'connected', buffer_server
         assert 'edit_buffer' in buffer_server['tools'], buffer_server
+        assert 'save_buffer' in buffer_server['tools'], buffer_server
+        assert buffer_server['tools']['save_buffer']['annotations']['readOnlyHint'] is False
         assert any(s['name'] == 'existing_user_server' and s['runtimeStatus'] == 'connected'
                    for s in status['data']), 'Existing global MCP servers must remain enabled'
         assert not any('features.shell_tool=false' in arg for arg in result['argv'])
+        # Permission changes in the native session must affect saves without
+        # restarting the bridge or replacing the session's current settings.
+        before_permissions = host.current_permissions(external)
+        probe_path = root / 'permission-probe.txt'
+        probe_path.write_bytes(b'unchanged bytes\n')
+        host.rpc.call('thread/settings/update', {'threadId': external,
+            'sandboxPolicy': {'type': 'dangerFullAccess'}, 'approvalPolicy': 'on-request'})
+        live = host.current_permissions(external)
+        assert live['sandbox']['type'] == 'dangerFullAccess'
+        assert host.write_allowed(str(probe_path), live)
+        assert probe_path.read_bytes() == b'unchanged bytes\n', 'Permission probes must never write'
+        new_probe_path = root / 'not-created-by-probe.txt'
+        assert host.write_allowed(str(new_probe_path), live)
+        assert not new_probe_path.exists(), 'Creation permission probes must not leave a file behind'
+        host.rpc.call('thread/settings/update', {'threadId': external,
+            'sandboxPolicy': {'type': 'readOnly'}, 'approvalPolicy': 'never'})
+        live = host.current_permissions(external)
+        assert live['sandbox']['type'] == 'readOnly' and live['approvalPolicy'] == 'never'
+        assert not host.write_allowed(str(probe_path), live)
+        host.rpc.call('thread/settings/update', {'threadId': external,
+            'sandboxPolicy': before_permissions['sandbox'], 'approvalPolicy': before_permissions['approvalPolicy']})
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
         process = subprocess.Popen(result['argv'], stdin=slave, stdout=slave, stderr=slave,

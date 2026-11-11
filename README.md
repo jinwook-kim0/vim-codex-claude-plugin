@@ -1,8 +1,8 @@
 # vim-codex
 
 터미널 Vim에서 Codex CLI pane과 답변 popup을 사용합니다. 저장하지 않은
-수정과 이름 없는 버퍼도 컨텍스트로 전달하며, 코드 변경은 디스크에 저장하지
-않고 Vim 버퍼에 적용합니다.
+수정과 이름 없는 버퍼도 컨텍스트로 전달합니다. 열린 파일은 버퍼에서 편집하고,
+새 파일과 열려 있지 않은 파일은 Codex가 현재 권한에 따라 직접 처리합니다.
 
 Linux, Vim 9.1 (`+terminal +popupwin +job +channel`), Python 3.11 이상,
 Codex CLI 0.166.0을 기준으로 구현했습니다. Python 외부 패키지와 fzf는 필요하지
@@ -115,19 +115,43 @@ UTF-16 열 번호도 별도로 제공합니다. 문자·줄·블록 선택을 �
 명령 실행 시 수집한 컨텍스트가 질문과 함께 전달됩니다. 예전 Visual 영역은
 일반 모드 명령에 자동으로 다시 붙이지 않습니다.
 
-Codex에는 `editor_context`, `list_buffers`, `read_buffer`, `edit_buffer` MCP
-도구를 제공합니다. 파일을 읽을 때 열린 버퍼의 미저장 내용을 우선 사용합니다.
-다른 프로젝트 파일은 버퍼로 불러와 수정하며 자동으로 창을 열지 않습니다.
-수정 목록은 `:CodexChanges`로 확인합니다.
+파일 편집은 다음과 같이 구분합니다.
 
-수정은 미저장 상태로 남고 `u`로 되돌릴 수 있습니다. 읽은 뒤 사용자가 버퍼를
-수정한 경우 `changedtick` 검사로 오래된 변경을 거부합니다. 디스크에 반영하려면
-직접 `:w` 또는 `:wa`를 실행하세요. 외부 테스트도 저장한 내용을 기준으로 실행해야 합니다.
+| 대상 | 편집과 저장 |
+|---|---|
+| 이미 열린 버퍼(숨겨진 loaded 버퍼 포함) | 현재 버퍼 내용을 읽고 버퍼에 편집. 미저장 내용도 포함 |
+| 새 파일 또는 Vim에 열려 있지 않은 파일 | Codex의 일반 파일·셸 도구로 생성·수정. 현재 세션 권한에 따라 실행 또는 승인 요청 |
+| `:badd`만 했거나 unload한 파일 | 미열림 파일로 처리. 읽거나 편집하려고 자동으로 load하지 않음 |
+
+버퍼용 도구는 `editor_context`, `list_buffers`, `read_buffer`, `edit_buffer`,
+`save_buffer`입니다. `read_buffer`/`edit_buffer`는 열린 버퍼만 처리하며,
+새 파일이나 미열림 파일을 버퍼에 가져오지 않습니다. `:CodexChanges`는 이번
+Vim에서 편집한 버퍼를 표시합니다. 디스크 파일의 직접 변경은 Codex 결과에서 확인합니다.
+
+열린 버퍼는 기본적으로 편집만 하고, 검증·빌드 등 다음 단계에서 디스크의 최신
+내용이 필요하면 Codex가 이유를 붙여 `save_buffer`를 호출합니다.
+
+* 세션의 현재 권한으로 해당 경로에 쓸 수 있으면 자동 저장합니다.
+* 권한이 부족하고 승인 요청이 허용된 정책이면 Vim에서 한 번 허용·해당 파일에
+  대해 세션 동안 허용·거절을 선택합니다.
+* 승인을 거절하거나, 권한도 없고 요청도 허용되지 않으면 저장하지 않습니다.
+  Codex는 미저장 변경으로 검증을 완료했다고 보고하지 않도록 안내받습니다.
+
+쓰기 권한은 시작 시 설정을 추측하지 않고 현재 세션에서 조회합니다. Codex의
+실제 sandbox/이름 있는 permission profile 안에서 파일을 변경하지 않는 쓰기
+권한 검사를 실행합니다. 따라서 CLI의 `/permissions` 변경도 반영합니다.
+명시적으로 허용한 파일별 세션 저장 권한은 permission 설정이 바뀌면 다시 확인합니다.
+
+저장은 Vim의 정상 `:write`를 사용하므로 파일 인코딩·개행과 사용자 쓰기 hook을
+유지합니다. 읽은 뒤 버퍼가 바뀌었거나, 디스크가 외부에서 변경됐거나, 승인한
+파일 경로가 달라지면 저장을 거부합니다. `readonly`도 강제로 해제하지 않습니다.
+쓰기 hook이 다시 버퍼를 수정하면 미저장 상태를 반환하므로 재확인 후 검증해야 합니다.
+직접 `:w`/`:wa`를 사용할 수도 있으며, 이름 없는 버퍼는 먼저 저장할 이름을 정해야 합니다.
 
 프로젝트 경계는 가장 가까운 `.git` 디렉터리 또는 파일입니다. Git 프로젝트가
 아니면 소스 파일의 디렉터리, 이름 없는 버퍼는 현재 작업 디렉터리를 사용합니다.
-기본적으로 프로젝트 밖 파일과 심볼릭 링크 대상도 읽고 Vim 버퍼로 수정할 수
-있습니다. 상대 경로는 세션의 프로젝트를 기준으로 해석합니다. 접근을 프로젝트
+기본적으로 프로젝트 밖에 열린 버퍼와 심볼릭 링크 대상도 편집할 수 있습니다.
+상대 경로는 세션의 프로젝트를 기준으로 해석합니다. 버퍼 도구의 접근을 프로젝트
 안으로 제한하려면 `g:codex_access_scope = 'project'`로 설정합니다.
 
 ## `/ide` 연결
@@ -158,9 +182,12 @@ let g:codex_executable = 'codex'
 let g:codex_python = 'python3'
 let g:codex_model = ''             " 빈 값이면 Codex 기본 설정
 let g:codex_extra_args = []        " app-server에 전달할 추가 CLI 인수 목록
-let g:codex_access_scope = 'global' " 외부 파일도 읽고 버퍼로 수정. 제한하려면 'project'.
-let g:codex_sandbox_mode = 'read-only' " 셸의 디스크 쓰기 정책. 버퍼 도구 접근과 별개.
-let g:codex_approval_policy = 'on-request'
+let g:codex_access_scope = 'global' " 외부의 열린 버퍼도 접근. 제한하려면 'project'.
+let g:codex_sandbox_mode = ''       " 기본: Codex 설정/재개한 세션의 권한을 상속
+let g:codex_approval_policy = ''    " 기본: Codex 설정/재개한 세션의 승인 정책을 상속
+" 명시적으로 제한할 경우:
+" let g:codex_sandbox_mode = 'read-only'
+" let g:codex_approval_policy = 'on-request'
 " 기본 상태 경로: $XDG_STATE_HOME/vim-codex 또는 ~/.local/state/vim-codex
 " let g:codex_state_dir = expand('~/.local/state/vim-codex')
 ```
@@ -180,15 +207,16 @@ Vim을 종료해도 선택과 마지막 답변을
 
 전역 skill과 그 지원 파일, 셸 도구, 기존 사용자 MCP 및 plugin 설정을 유지합니다.
 분리한 CLI home에서도 원래 Codex home의 skill·plugin·규칙을 참조합니다.
-기존 설정 파일은 수정하지 않습니다. 소스 편집은 계속 Vim 버퍼를 사용하도록
-지시합니다. 외부 skill 실행에 추가 권한이 필요하면 Vim에 요청을 표시하고,
+기존 설정 파일은 수정하지 않습니다. 열린 파일은 버퍼에서 편집하고, 미열림
+파일은 일반 파일 도구로 처리하도록 지시합니다. 외부 skill 실행에 추가 권한이 필요하면 Vim에 요청을 표시하고,
 한 번 허용·세션 동안 허용·거절을 선택할 수 있습니다. 사용자의 판단 없이
 권한 요청을 일괄 거절하거나 자동 허용하지 않습니다.
 
-기본 셸 sandbox는 `read-only`이며 읽기와 skill 검색을 프로젝트 내부로
-제한하지 않습니다. Skill의 파일 생성 등 디스크 쓰기까지 기본 허용하려면
-`g:codex_sandbox_mode = 'workspace-write'` 등 필요한 Codex 정책을 명시합니다.
-이는 직접 디스크 쓰기의 권한을 바꾸므로, Vim 버퍼 편집과 구분해서 설정하세요.
+Sandbox와 승인 정책은 기본적으로 Codex 설정 또는 재개한 세션에서 상속합니다.
+플러그인이 매 질문마다 권한을 초기화하지 않으므로 CLI에서 바꾼 권한이 유지됩니다.
+`g:codex_sandbox_mode`/`g:codex_approval_policy`는 시작·재개 시 명시적으로
+덮어쓸 필요가 있을 때만 설정하세요. 파일 생성·미열림 파일 수정·skill 실행은
+Codex 자체의 권한과 승인 처리를 그대로 따릅니다.
 
 ## 검증
 

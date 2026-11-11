@@ -13,8 +13,8 @@ let g:codex_python = get(g:, 'codex_python', 'python3')
 let g:codex_model = get(g:, 'codex_model', '')
 let g:codex_extra_args = get(g:, 'codex_extra_args', [])
 let g:codex_access_scope = get(g:, 'codex_access_scope', 'global')
-let g:codex_sandbox_mode = get(g:, 'codex_sandbox_mode', 'read-only')
-let g:codex_approval_policy = get(g:, 'codex_approval_policy', 'on-request')
+let g:codex_sandbox_mode = get(g:, 'codex_sandbox_mode', '')
+let g:codex_approval_policy = get(g:, 'codex_approval_policy', '')
 let g:codex_state_dir = get(g:, 'codex_state_dir',
       \ empty($XDG_STATE_HOME) ? expand('~/.local/state/vim-codex') : $XDG_STATE_HOME . '/vim-codex')
 
@@ -46,6 +46,7 @@ augroup vim_codex
   autocmd!
   autocmd BufEnter,CursorMoved,CursorMovedI,TextChanged,TextChangedI * call codex#Track()
   autocmd BufWritePost * call codex#Track()
+  autocmd BufReadPost,BufWritePost * call codex#RememberDisk()
   autocmd VimLeavePre * call codex#Shutdown()
   if exists('##ModeChanged')
     autocmd ModeChanged * call codex#Track()

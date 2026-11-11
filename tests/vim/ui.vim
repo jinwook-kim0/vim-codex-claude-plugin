@@ -96,6 +96,33 @@ call WaitFor('PopupText() =~# "Permission accepted"')
 call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
 call feedkeys('q', 'xt')
 
+" Existing hidden buffers save through MCP only when current permissions allow.
+call mkdir('tests/.results', 'p')
+let s:save_path = getcwd() . '/tests/.results/save-buffer-' . getpid() . '.txt'
+call writefile(['before validation'], s:save_path)
+let s:save_nr = bufadd(s:save_path)
+call bufload(s:save_nr)
+execute 'CodexPopAsk SAVE_BUFFER buffer=' . s:save_nr
+call WaitFor('PopupText() =~# "Saved for validation"')
+call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call assert_equal(['saved by fixture'], readfile(s:save_path))
+call assert_false(getbufvar(s:save_nr, '&modified'))
+call assert_equal(s:source, bufnr('%'))
+call feedkeys('q', 'xt')
+
+" Declining a required save leaves disk unchanged and does not validate.
+execute 'CodexPopAsk SAVE_CONFIRM buffer=' . s:save_nr
+call WaitFor('PermissionVisible()')
+call feedkeys("\<Esc>", 'xt')
+call WaitFor('PopupText() =~# "save declined"')
+call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call assert_equal(['saved by fixture'], readfile(s:save_path))
+call assert_true(getbufvar(s:save_nr, '&modified'))
+call assert_false(PopupText() =~# 'Saved for validation')
+call feedkeys('q', 'xt')
+execute 'bwipeout! ' . s:save_nr
+call delete(s:save_path)
+
 CodexPopResume
 call WaitFor('!empty(popup_list())')
 call feedkeys("\<CR>", 'xt')

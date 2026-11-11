@@ -299,15 +299,14 @@ endfunction
 " byte positions; utf16_column is supplied separately for native IDE clients.
 function! codex#Context(range, first, last) abort
   call codex#Track()
-  if s:last_buffer < 0 || !bufexists(s:last_buffer) || getbufvar(s:last_buffer, '&buftype') !=# '' || getbufvar(s:last_buffer, 'codex_ui', 0)
-    let candidates = filter(copy(s:source_history), 'bufexists(v:val) && getbufvar(v:val, "&buftype") ==# "" && !getbufvar(v:val, "codex_ui", 0)')
+  if s:last_buffer < 0 || !bufloaded(s:last_buffer) || getbufvar(s:last_buffer, '&buftype') !=# '' || getbufvar(s:last_buffer, 'codex_ui', 0)
+    let candidates = filter(copy(s:source_history), 'bufloaded(v:val) && getbufvar(v:val, "&buftype") ==# "" && !getbufvar(v:val, "codex_ui", 0)')
     let s:last_buffer = empty(candidates) ? -1 : candidates[-1]
   endif
   let nr = s:last_buffer
   if nr < 0 || !bufexists(nr)
     throw 'No source buffer available'
   endif
-  call bufload(nr)
   let lines = getbufline(nr, 1, '$')
   let path = empty(bufname(nr)) ? '' : resolve(fnamemodify(bufname(nr), ':p'))
   let root = s:Root(path)
@@ -822,8 +821,8 @@ endfunction
 function! s:Target(arguments, root) abort
   if has_key(a:arguments, 'buffer_id')
     let nr = a:arguments.buffer_id
-    if !bufexists(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
-      throw 'Not an editable source buffer'
+    if !bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
+      throw 'File is not open in a source buffer; use normal Codex file tools under current permissions'
     endif
     let path = empty(bufname(nr)) ? '' : resolve(fnamemodify(bufname(nr), ':p'))
     if empty(path) && g:codex_access_scope ==# 'project'
@@ -844,13 +843,13 @@ function! s:Target(arguments, root) abort
     endif
     let nr = -1
     for info in getbufinfo()
-      if !empty(info.name) && resolve(fnamemodify(info.name, ':p')) ==# path
+      if info.loaded && !empty(info.name) && resolve(fnamemodify(info.name, ':p')) ==# path
         let nr = info.bufnr
         break
       endif
     endfor
     if nr < 0
-      let nr = bufadd(path)
+      throw 'File is not open in Vim; use normal Codex file tools under current permissions'
     endif
   else
     let nr = get(s:source_buffers, a:root, -1)
@@ -859,25 +858,110 @@ function! s:Target(arguments, root) abort
     endif
     return s:Target({'buffer_id': nr}, a:root)
   endif
-  call bufload(nr)
+  if !bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
+    throw 'File is not open in a source buffer; use normal Codex file tools under current permissions'
+  endif
   call setbufvar(nr, 'codex_root', a:root)
   return nr
 endfunction
 
+function! s:DiskState(path) abort
+  if empty(a:path) || empty(getftype(a:path))
+    return {'path': a:path, 'exists': 0, 'hash': ''}
+  endif
+  if getftype(a:path) !=# 'file'
+    throw 'Save target is not a regular file'
+  endif
+  return {'path': a:path, 'exists': 1, 'hash': sha256(join(readfile(a:path, 'b'), "\n"))}
+endfunction
+
+function! codex#RememberDisk(...) abort
+  let nr = a:0 ? a:1 : bufnr('%')
+  if !bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
+    return
+  endif
+  let path = empty(bufname(nr)) ? '' : resolve(fnamemodify(bufname(nr), ':p'))
+  try
+    call setbufvar(nr, 'codex_disk_state', s:DiskState(path))
+  catch
+    call setbufvar(nr, 'codex_disk_state', {'path': path, 'error': v:exception})
+  endtry
+endfunction
+
 function! s:BufferInfo(nr) abort
   let path = empty(bufname(a:nr)) ? '' : resolve(fnamemodify(bufname(a:nr), ':p'))
+  if empty(getbufvar(a:nr, 'codex_disk_state', {}))
+    call codex#RememberDisk(a:nr)
+  endif
+  try
+    let disk_changed = getbufvar(a:nr, 'codex_disk_state') !=# s:DiskState(path)
+  catch
+    let disk_changed = 1
+  endtry
   return {'buffer_id': a:nr, 'path': path, 'on_disk': filereadable(path) ? v:true : v:false,
         \ 'buffer_uri': 'vim-buffer://' . s:instance . '/' . a:nr,
         \ 'changedtick': getbufvar(a:nr, 'changedtick'),
         \ 'modified': getbufvar(a:nr, '&modified') ? v:true : v:false,
+        \ 'disk_changed': disk_changed ? v:true : v:false,
         \ 'lines': getbufline(a:nr, 1, '$')}
+endfunction
+
+function! s:SaveBuffer(nr, args) abort
+  let info = s:BufferInfo(a:nr)
+  if info.changedtick != a:args.expected_tick
+    throw 'Stale buffer: content changed while save permission was pending; read it again'
+  endif
+  if empty(info.path) || info.path !=# get(a:args, 'authorized_path', '')
+    throw 'Save target differs from the authorized path'
+  endif
+  if info.disk_changed
+    throw 'File changed on disk since Vim read/saved it; reconcile before saving'
+  endif
+  if getbufvar(a:nr, '&readonly') || !getbufvar(a:nr, '&modifiable')
+    throw 'Buffer is not writable; save was not forced'
+  endif
+  let origin_window = win_getid()
+  let origin_buffer = bufnr('%')
+  let origin_view = winsaveview()
+  let source = s:last_buffer
+  let sources = copy(s:source_buffers)
+  let history = copy(s:source_history)
+  try
+    let target_window = bufwinid(a:nr)
+    if target_window != -1
+      call win_gotoid(target_window)
+    elseif bufnr('%') != a:nr
+      execute 'noautocmd keepalt keepjumps hide buffer ' . a:nr
+    endif
+    " Use Vim's normal write path: encoding, EOL, write guards and user hooks.
+    silent keepalt write
+    call codex#RememberDisk(a:nr)
+  finally
+    if win_getid() != origin_window
+      call win_gotoid(origin_window)
+    endif
+    if bufnr('%') != origin_buffer && bufexists(origin_buffer)
+      execute 'noautocmd keepalt keepjumps hide buffer ' . origin_buffer
+    endif
+    call winrestview(origin_view)
+    let s:last_buffer = source
+    let s:source_buffers = sources
+    let s:source_history = history
+  endtry
+  let result = s:BufferInfo(a:nr)
+  let result.saved = !result.modified ? v:true : v:false
+  if !result.saved
+    let result.message = 'Write completed, but a write hook left new unsaved changes; re-read before validation'
+  endif
+  echomsg '[codex] Saved buffer: ' . info.path
+  return result
 endfunction
 
 function! codex#BufferRequest(operation, arguments, root) abort
   if a:operation ==# 'editor_context'
     let nr = get(s:source_buffers, a:root, -1)
-    if nr >= 0 && (getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0))
-      let candidates = filter(copy(s:source_history), 'bufexists(v:val) && getbufvar(v:val, "&buftype") ==# "" && !getbufvar(v:val, "codex_ui", 0) && s:Root(empty(bufname(v:val)) ? "" : fnamemodify(bufname(v:val), ":p")) ==# a:root')
+    if nr >= 0 && (!bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0))
+      let candidates = filter(copy(s:source_history), 'bufloaded(v:val) && getbufvar(v:val, "&buftype") ==# "" && !getbufvar(v:val, "codex_ui", 0) && s:Root(empty(bufname(v:val)) ? "" : fnamemodify(bufname(v:val), ":p")) ==# a:root')
       let nr = empty(candidates) ? -1 : candidates[-1]
       let s:source_buffers[a:root] = nr
     endif
@@ -911,7 +995,7 @@ function! codex#BufferRequest(operation, arguments, root) abort
   elseif a:operation ==# 'list_buffers'
     let buffers = []
     for info in getbufinfo()
-      if getbufvar(info.bufnr, '&buftype') ==# '' && !getbufvar(info.bufnr, 'codex_ui', 0)
+      if info.loaded && getbufvar(info.bufnr, '&buftype') ==# '' && !getbufvar(info.bufnr, 'codex_ui', 0)
         let path = empty(info.name) ? '' : resolve(fnamemodify(info.name, ':p'))
         if g:codex_access_scope ==# 'global' || (!empty(path) && s:Within(path, a:root)) || get(s:source_buffers, a:root, -1) == info.bufnr || getbufvar(info.bufnr, 'codex_root', '') ==# a:root
           let item = s:BufferInfo(info.bufnr)
@@ -921,12 +1005,14 @@ function! codex#BufferRequest(operation, arguments, root) abort
       endif
     endfor
     return buffers
-  elseif index(['read_buffer', 'edit_buffer'], a:operation) < 0
+  elseif index(['read_buffer', 'edit_buffer', 'save_buffer'], a:operation) < 0
     throw 'Unknown buffer operation'
   endif
   let nr = s:Target(a:arguments, a:root)
   if a:operation ==# 'read_buffer'
     return s:BufferInfo(nr)
+  elseif a:operation ==# 'save_buffer'
+    return s:SaveBuffer(nr, a:arguments)
   endif
   let args = a:arguments
   if getbufvar(nr, 'changedtick') != args.expected_tick
@@ -1028,8 +1114,8 @@ function! codex#Status() abort
   echomsg '[codex] backend=' . g:codex_pane_backend . ' codex=' . g:codex_executable
         \ . ' python=' . g:codex_python . ' state=' . expand(g:codex_state_dir)
         \ . ' bridge=' . (type(s:job) == v:t_job ? job_status(s:job) : 'not started')
-        \ . ' access=' . g:codex_access_scope . ' sandbox=' . g:codex_sandbox_mode
-        \ . ' approval=' . g:codex_approval_policy
+        \ . ' access=' . g:codex_access_scope . ' sandbox_override=' . (empty(g:codex_sandbox_mode) ? 'inherit' : g:codex_sandbox_mode)
+        \ . ' approval_override=' . (empty(g:codex_approval_policy) ? 'inherit' : g:codex_approval_policy)
   try
     call codex#Track()
     let path = empty(bufname(s:last_buffer)) ? '' : fnamemodify(bufname(s:last_buffer), ':p')
