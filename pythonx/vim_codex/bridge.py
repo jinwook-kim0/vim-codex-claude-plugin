@@ -261,6 +261,8 @@ class Host:
         self.buffer_pending = {}
         self.buffer_lock = threading.Lock()
         self.interactive_pending = {}
+        self.server_pending = {}
+        self.finished_server_requests = {}
         self.tool_sessions = {}
         self.save_grants = {}
         self.save_locks = {}
@@ -351,9 +353,6 @@ class Host:
             self.rpc.ws.send({'method': 'initialized'})
 
     def server_request(self, message):
-        threading.Thread(target=self.interactive_request, args=(message,), daemon=True).start()
-
-    def interactive_request(self, message):
         method = message['method']
         if not (method.endswith('/requestApproval') or method == 'tool/requestUserInput'):
             self.rpc.ws.send({'id': message['id'], 'error': {
@@ -362,15 +361,30 @@ class Host:
         request_id = secrets.token_hex(12)
         event, slot = threading.Event(), {}
         with self.buffer_lock:
+            if message['id'] in self.server_pending or message['id'] in self.finished_server_requests:
+                return
             self.interactive_pending[request_id] = (event, slot)
+            self.server_pending[message['id']] = (request_id, event, slot)
+        # Publish synchronously on the RPC reader, before it can receive the
+        # matching serverRequest/resolved notification from another client.
+        self.emit({'event': 'input_request' if method == 'tool/requestUserInput' else 'approval_request',
+                   'request_id': request_id, 'method': method, 'params': message.get('params', {}),
+                   'native': True, 'thread_id': message.get('params', {}).get('threadId')})
+        threading.Thread(target=self.interactive_request,
+                         args=(message, request_id, event, slot), daemon=True).start()
+
+    def interactive_request(self, message, request_id, event, slot):
+        method = message['method']
         try:
-            self.emit({'event': 'input_request' if method == 'tool/requestUserInput' else 'approval_request',
-                       'request_id': request_id, 'method': method, 'params': message.get('params', {})})
             event.wait()
+            if slot.get('resolved'):
+                return
             decision = slot.get('decision', 'decline')
         finally:
             with self.buffer_lock:
                 self.interactive_pending.pop(request_id, None)
+                self.server_pending.pop(message['id'], None)
+                self.remember_finished_request(message['id'])
         if method == 'item/permissions/requestApproval':
             result = {'permissions': message.get('params', {}).get('permissions', {})
                       if decision in ('accept', 'acceptForSession') else {},
@@ -379,13 +393,31 @@ class Host:
             result = {'decision': decision}
         else:
             result = {'answers': slot.get('answers', {})}
-        if not self.stopping:
+        if not self.stopping and not slot.get('resolved'):
             self.rpc.ws.send({'id': message['id'], 'result': result})
+
+    def resolve_server_request(self, server_id):
+        with self.buffer_lock:
+            self.remember_finished_request(server_id)
+            pending = self.server_pending.get(server_id)
+            if not pending:
+                return
+            request_id, event, slot = pending
+            slot['resolved'] = True
+            event.set()
+        self.emit({'event': 'interactive_resolved', 'request_id': request_id})
+
+    def remember_finished_request(self, server_id):
+        # Called under buffer_lock. A resume can replay pending requests; never
+        # open a second UI for an already answered/cancelled request id.
+        self.finished_server_requests[server_id] = None
+        if len(self.finished_server_requests) > 1024:
+            self.finished_server_requests.pop(next(iter(self.finished_server_requests)))
 
     def interactive_reply(self, message):
         with self.buffer_lock:
             pending = self.interactive_pending.get(message['request_id'])
-            if pending:
+            if pending and not pending[1].get('resolved'):
                 pending[1].update(message)
                 pending[0].set()
 
@@ -661,8 +693,15 @@ class Host:
 
     def notification(self, method, params):
         thread_id = params.get('threadId')
+        if method == 'serverRequest/resolved':
+            self.resolve_server_request(params['requestId'])
+            return
         if method == 'bridge/disconnected':
             if not self.stopping:
+                with self.buffer_lock:
+                    pending = list(self.server_pending)
+                for request in pending:
+                    self.resolve_server_request(request)
                 self.emit({'event': 'error', 'message': params['message']})
             return
         if thread_id not in self.loaded:

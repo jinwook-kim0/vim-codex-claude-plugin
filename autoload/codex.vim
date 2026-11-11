@@ -17,6 +17,8 @@ let s:context_popup = 0
 let s:context_timer = -1
 let s:context_root = ''
 let s:refreshing = 0
+let s:interactive = {}
+let s:interactive_timer = -1
 
 function! s:Error(text) abort
   echohl ErrorMsg
@@ -238,6 +240,86 @@ function! s:ContextFilter(id, key) abort
 endfunction
 
 function! s:Interactive(message) abort
+  let s:interactive[a:message.request_id] = {'message': a:message, 'popup': 0, 'shown': 0}
+  call s:RouteInteractive(a:message.request_id)
+  if !empty(s:interactive) && s:interactive_timer == -1
+    let s:interactive_timer = timer_start(200, function('s:RefreshInteractive'), {'repeat': -1})
+  endif
+endfunction
+
+function! s:WantVimPrompt(message) abort
+  " Only defer a native request when the same thread has a live tmux TUI.
+  " Popup sessions and Vim-only save confirmations have no native duplicate.
+  if !get(a:message, 'native', 0) || empty($TMUX) || empty($TMUX_PANE)
+    return 1
+  endif
+  let thread = get(a:message, 'thread_id', get(get(a:message, 'params', {}), 'threadId', ''))
+  if type(thread) != v:t_string || empty(thread)
+    return 1
+  endif
+  for pane in values(s:panes)
+    if get(pane, 'thread_id', '') ==# thread && s:OwnTmux(pane)
+      let dead = trim(s:System(['tmux', 'display-message', '-p', '-t', pane.tmux, '#{pane_dead}']))
+      if v:shell_error || dead ==# '1'
+        return 1
+      endif
+      let focus = trim(s:System(['tmux', 'display-message', '-p', '-t', $TMUX_PANE,
+            \ '#{window_active}:#{pane_active}']))
+      return v:shell_error ? 1 : focus ==# '1:1'
+    endif
+  endfor
+  return 1
+endfunction
+
+function! s:RouteInteractive(request) abort
+  if !has_key(s:interactive, a:request)
+    return
+  endif
+  let state = s:interactive[a:request]
+  if s:WantVimPrompt(state.message)
+    if !state.shown
+      let state.shown = 1
+      call s:ShowInteractive(state.message)
+    elseif state.popup > 0 && !empty(popup_getpos(state.popup))
+      call popup_show(state.popup)
+    endif
+  elseif state.popup > 0 && !empty(popup_getpos(state.popup))
+    " Hiding must not invoke the close callback or synthesize a rejection.
+    call popup_hide(state.popup)
+  endif
+endfunction
+
+function! s:RefreshInteractive(timer) abort
+  if s:closing || empty(s:interactive)
+    call timer_stop(a:timer)
+    let s:interactive_timer = -1
+    return
+  endif
+  for request in keys(s:interactive)
+    call s:RouteInteractive(request)
+  endfor
+endfunction
+
+function! s:DismissInteractive(request) abort
+  if !has_key(s:interactive, a:request)
+    return
+  endif
+  let state = remove(s:interactive, a:request)
+  if state.popup > 0 && !empty(popup_getpos(state.popup))
+    " Remove first: popup_close runs the callback, which must not reply again.
+    call popup_close(state.popup)
+  endif
+endfunction
+
+function! s:ReplyInteractive(message) abort
+  if !has_key(s:interactive, a:message.request_id)
+    return
+  endif
+  call remove(s:interactive, a:message.request_id)
+  call ch_sendraw(job_getchannel(s:job), json_encode(a:message) . "\n")
+endfunction
+
+function! s:ShowInteractive(message) abort
   if a:message.event ==# 'input_request'
     let answers = {}
     call inputsave()
@@ -252,8 +334,8 @@ function! s:Interactive(message) abort
       endfor
     finally
       call inputrestore()
-      call ch_sendraw(job_getchannel(s:job), json_encode({'op': 'interactive_reply',
-            \ 'request_id': a:message.request_id, 'answers': answers}) . "\n")
+      call s:ReplyInteractive({'op': 'interactive_reply',
+            \ 'request_id': a:message.request_id, 'answers': answers})
     endtry
     return
   endif
@@ -265,17 +347,20 @@ function! s:Interactive(message) abort
   if has_key(a:message.params, 'permissions')
     let details .= ' ' . json_encode(a:message.params.permissions)
   endif
-  call popup_menu(['Allow once', 'Allow for this session', 'Reject'], {
+  let popup = popup_menu(['Allow once', 'Allow for this session', 'Reject'], {
         \ 'title': ' Codex permission: ' . substitute(details, '[\r\n]', ' ', 'g'),
         \ 'maxwidth': max([20, &columns - 8]),
         \ 'callback': function('s:ApprovalChosen', [a:message.request_id])})
+  if has_key(s:interactive, a:message.request_id)
+    let s:interactive[a:message.request_id].popup = popup
+  endif
 endfunction
 
 function! s:ApprovalChosen(request, id, index) abort
   let choices = ['accept', 'acceptForSession', 'decline']
   let decision = a:index >= 1 && a:index <= 3 ? choices[a:index - 1] : 'decline'
-  call ch_sendraw(job_getchannel(s:job), json_encode({'op': 'interactive_reply',
-        \ 'request_id': a:request, 'decision': decision}) . "\n")
+  call s:ReplyInteractive({'op': 'interactive_reply',
+        \ 'request_id': a:request, 'decision': decision})
 endfunction
 
 function! s:BlockSlice(text, left, right) abort
@@ -411,6 +496,13 @@ endfunction
 
 function! s:Exited(job, status) abort
   if !s:closing
+    for request in keys(s:interactive)
+      call s:DismissInteractive(request)
+    endfor
+    if s:interactive_timer != -1
+      call timer_stop(s:interactive_timer)
+      let s:interactive_timer = -1
+    endif
     let s:pending = {}
     call s:Error('Bridge exited (' . a:status . '); use :CodexStatus to inspect configuration')
   endif
@@ -447,6 +539,8 @@ function! s:Output(channel, text) abort
       call s:RefreshContext(-1)
     elseif index(['approval_request', 'input_request'], get(message, 'event', '')) >= 0
       call s:Interactive(message)
+    elseif get(message, 'event', '') ==# 'interactive_resolved'
+      call s:DismissInteractive(message.request_id)
     elseif get(message, 'mode', '') ==# 'popup'
       call s:Answer(message)
     endif
@@ -1126,6 +1220,13 @@ endfunction
 
 function! codex#Shutdown() abort
   let s:closing = 1
+  if s:interactive_timer != -1
+    call timer_stop(s:interactive_timer)
+    let s:interactive_timer = -1
+  endif
+  for request in keys(s:interactive)
+    call s:DismissInteractive(request)
+  endfor
   if s:context_timer != -1
     call timer_stop(s:context_timer)
     let s:context_timer = -1

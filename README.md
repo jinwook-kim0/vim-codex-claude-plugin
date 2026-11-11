@@ -74,6 +74,16 @@ Pane은 Codex의 기본 CLI 화면입니다. 새 대화와 대화 선택은 Vim 
 `:CodexNew`, `:CodexResume`으로 관리해야 플러그인이 선택한 세션과 일치합니다.
 CLI의 `/new`나 `/resume`으로 직접 전환한 세션은 플러그인 목록과 동기화하지 않습니다.
 
+tmux에서는 Codex 자체의 권한·질문 요청을 현재 포커스에 따라 표시합니다.
+Vim pane에 포커스가 있으면 Vim popup에서 선택하고, 같은 세션의 Codex pane에
+포커스가 있으면 Vim popup을 생략하고 Codex 화면에서 선택합니다. 대기 중에
+포커스를 옮기면 Vim popup을 숨기거나 다시 표시하며, 숨김을 거절로 처리하지
+않습니다. Codex에서 선택을 마쳤거나 요청이 취소되면 Vim 쪽 대기도 정리합니다.
+재전송된 동일 요청으로 popup이 중복 생성되지 않습니다.
+
+Popup 전용 세션이나 Vim 자체의 버퍼 저장 확인처럼 Codex CLI에 대응하는
+확인창이 없는 요청은 Vim에서 선택합니다.
+
 ## 컨텍스트 표시
 
 Vim pane의 상태줄과 tmux pane의 테두리에 다음과 같이 표시합니다.

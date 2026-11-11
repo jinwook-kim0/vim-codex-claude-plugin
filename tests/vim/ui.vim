@@ -24,7 +24,7 @@ endfunction
 
 function! PermissionVisible() abort
   for id in popup_list()
-    if index(getbufline(winbufnr(id), 1, '$'), 'Allow once') >= 0
+    if get(popup_getpos(id), 'visible', 0) && index(getbufline(winbufnr(id), 1, '$'), 'Allow once') >= 0
       return 1
     endif
   endfor
@@ -96,6 +96,14 @@ call WaitFor('PopupText() =~# "Permission accepted"')
 call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
 call feedkeys('q', 'xt')
 
+" A native answer closes the outstanding Vim popup without declining it.
+CodexPopAsk NATIVE_RESOLVE
+call WaitFor('PermissionVisible()')
+call WaitFor('!PermissionVisible()')
+call WaitFor('PopupText() =~# "Permission accepted"')
+call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call feedkeys('q', 'xt')
+
 " Existing hidden buffers save through MCP only when current permissions allow.
 call mkdir('tests/.results', 'p')
 let s:save_path = getcwd() . '/tests/.results/save-buffer-' . getpid() . '.txt'
@@ -158,6 +166,28 @@ else
   call assert_equal(2, str2nr(system('tmux list-panes -F "#{pane_id}" | wc -l')))
   call assert_true(system('tmux list-panes -F "#{@vim_codex_context}"') =~# '\[No Name\]')
   call assert_equal('top', trim(system('tmux show-options -wAv pane-border-status')))
+  let s:codex_pane = filter(split(system('tmux list-panes -F "#{pane_id}"'), "\n"), 'v:val !=# $TMUX_PANE')[0]
+
+  " Codex is focused: the native request must not open a Vim popup.
+  CodexAsk NATIVE_RESOLVE
+  sleep 300m
+  call assert_false(PermissionVisible())
+  sleep 600m
+  call assert_false(PermissionVisible())
+
+  " A pending native request follows focus without accepting/rejecting it.
+  CodexAsk REQUEST_APPROVAL
+  sleep 300m
+  call assert_false(PermissionVisible())
+  call system('tmux select-pane -t ' . shellescape($TMUX_PANE))
+  call WaitFor('PermissionVisible()')
+  call system('tmux select-pane -t ' . shellescape(s:codex_pane))
+  call WaitFor('!PermissionVisible()')
+  call system('tmux select-pane -t ' . shellescape($TMUX_PANE))
+  call WaitFor('PermissionVisible()')
+  call feedkeys("\<CR>", 'xt')
+  sleep 300m
+  call assert_false(PermissionVisible())
   CodexHide
   call assert_equal(1, str2nr(system('tmux list-panes -F "#{pane_id}" | wc -l')))
   call assert_equal('off', trim(system('tmux show-options -wAv pane-border-status')))

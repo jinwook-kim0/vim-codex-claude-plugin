@@ -94,12 +94,18 @@ class Handler(socketserver.BaseRequestHandler):
                 if not saved.get('saved'):
                     raise RuntimeError('Save did not finish; validation was not run')
                 answer = 'Saved for validation'
-            elif 'REQUEST_APPROVAL' in text:
+            elif 'REQUEST_APPROVAL' in text or 'NATIVE_RESOLVE' in text:
                 request_id = 'permission-' + turn_id
-                event, slot = threading.Event(), {}
+                event, slot = threading.Event(), {'threadId': thread_id}
                 self.approvals[request_id] = (event, slot)
                 self.send({'id': request_id, 'method': 'item/commandExecution/requestApproval',
-                           'params': {'command': 'fixture skill helper', 'reason': 'Skill helper needs permission'}})
+                           'params': {'threadId': thread_id, 'command': 'fixture skill helper',
+                                      'reason': 'Skill helper needs permission'}})
+                if 'NATIVE_RESOLVE' in text and not event.wait(.5):
+                    # Stand in for the other native CLI client answering first.
+                    slot['result'] = {'decision': 'accept'}
+                    self.notify('serverRequest/resolved', {'requestId': request_id, 'threadId': thread_id})
+                    event.set()
                 if not event.wait(10):
                     raise TimeoutError('Permission fixture timed out')
                 answer = 'Permission accepted' if slot.get('result', {}).get('decision') == 'accept' else 'Permission declined'
@@ -134,6 +140,8 @@ class Handler(socketserver.BaseRequestHandler):
                     pending = self.approvals.get(message['id'])
                     if pending:
                         pending[1].update(message)
+                        self.notify('serverRequest/resolved', {'requestId': message['id'],
+                                    'threadId': pending[1]['threadId']})
                         pending[0].set()
                     continue
                 method, params = message['method'], message.get('params', {})

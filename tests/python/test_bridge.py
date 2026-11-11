@@ -246,6 +246,27 @@ class HostTests(unittest.TestCase):
         self.wait(lambda: bool(replies))
         self.assertEqual({'id': 'approval-1', 'result': {'decision': 'accept'}}, replies[0])
 
+    def test_native_resolution_cancels_vim_wait_without_sending_a_second_decision(self):
+        replies = []
+        self.host.rpc = SimpleNamespace(ws=SimpleNamespace(send=replies.append), close=lambda: None)
+        self.host.server_request({'id': 42, 'method': 'item/commandExecution/requestApproval',
+                                  'params': {'threadId': 'native-thread', 'command': 'helper'}})
+        record = next(e for e in self.events if e.get('event') == 'approval_request')
+        self.assertTrue(record['native'])
+        self.assertEqual('native-thread', record['thread_id'])
+        self.host.server_request({'id': 42, 'method': 'item/commandExecution/requestApproval',
+                                  'params': {'threadId': 'native-thread', 'command': 'helper'}})
+        self.assertEqual(1, sum(e.get('event') == 'approval_request' for e in self.events))
+        self.host.notification('serverRequest/resolved', {'requestId': 42, 'threadId': 'native-thread'})
+        self.wait(lambda: 42 not in self.host.server_pending)
+        self.assertTrue(any(e.get('event') == 'interactive_resolved' and
+                            e['request_id'] == record['request_id'] for e in self.events))
+        self.host.interactive_reply({'request_id': record['request_id'], 'decision': 'decline'})
+        self.host.server_request({'id': 42, 'method': 'item/commandExecution/requestApproval',
+                                  'params': {'threadId': 'native-thread', 'command': 'helper'}})
+        self.assertEqual(1, sum(e.get('event') == 'approval_request' for e in self.events))
+        self.assertEqual([], replies, 'A native CLI answer must not be overwritten by a synthetic Vim rejection')
+
 
 if __name__ == '__main__':
     unittest.main()
