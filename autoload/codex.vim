@@ -19,10 +19,143 @@ let s:context_root = ''
 let s:refreshing = 0
 let s:interactive = {}
 let s:interactive_timer = -1
+let s:provider = get(g:, 'codex_provider', 'codex')
+let s:started = 0
+let s:help_popup = 0
+let s:help_buffer = -1
+
+function! s:Name() abort
+  return s:provider ==# 'claude' ? 'Claude' : 'Codex'
+endfunction
+
+function! codex#Dispatch(provider, action, arguments) abort
+  if s:started && s:provider !=# a:provider
+    call s:Error('This Vim uses ' . s:Name() . '; restart Vim to change provider')
+    return
+  endif
+  let s:provider = a:provider
+  call call('codex#' . a:action, a:arguments)
+endfunction
+
+function! s:HelpLines() abort
+  let name = s:Name()
+  let commands = [
+        \ ['', 'pane 열기 / 현재 프로젝트의 선택된 대화 이어가기'],
+        \ ['Ask {질문}', '컨텍스트와 질문을 pane으로 전송 (생략하면 질문 입력)'],
+        \ ['Resume', '기존 터미널 세션을 포함한 pane 대화 선택 후 열기'],
+        \ ['New', 'pane용 새 대화 시작'],
+        \ ['Hide', 'pane 숨기기/닫기, 대화 기록 유지'],
+        \ ['PopAsk {질문}', '독립된 popup 대화에 질문, 답변 스트리밍'],
+        \ ['PopResume', '이전 popup 대화 선택만 수행'],
+        \ ['PopNew', 'popup용 새 대화 선택'],
+        \ ['PopReopen', '현재 popup 대화의 마지막 답변 다시 열기'],
+        \ ['PopStop', '진행 중인 popup 응답 중단'],
+        \ ['Changes', '이번 Vim에서 변경한 버퍼 목록'],
+        \ ['Status', '실행 파일, pane 설정, 연결 상태 확인'],
+        \ ['Context', '현재 컨텍스트와 마지막 전달 내역 확인'],
+        \ ['Context!', '실제 제공했던 컨텍스트 본문을 읽기 전용 split으로 확인'],
+        \ ['Help', '이 도움말 popup 열기'],
+        \ ['Help!', '이 도움말을 Vim vertical split으로 열기']]
+  let lines = ['# Vim Codex / Claude 도움말', '',
+        \ '현재 CLI: ' . name . ' | pane 설정: ' . g:codex_pane_backend, '',
+        \ '## 단축키 (일반 / Visual 모드)', '',
+        \ '\ca   pane 질문 입력     :' . name . 'Ask',
+        \ '\cpa  popup 질문 입력    :' . name . 'PopAsk',
+        \ '\ch   명령어/단축키 도움말', '',
+        \ '백슬래시(\)는 mapleader와 관계없는 실제 키입니다.', '',
+        \ '## 명령어', '']
+  for command in commands
+    call extend(lines, [':' . name . command[0], '  ' . command[1]])
+  endfor
+  call extend(lines, ['', 'Codex는 :Codex..., Claude Code는 :Claude... 명령을 사용합니다.',
+        \ '예: :CodexPopAsk 이 코드를 설명해줘 / :ClaudePopAsk 이 코드를 설명해줘',
+        \ '시작 전 g:codex_provider = ''codex'' 또는 ''claude''로 기본 CLI를 선택합니다.',
+        \ '한 Vim에서는 한 CLI를 사용하며, 연결 후 CLI 변경은 Vim 재시작이 필요합니다.', '',
+        \ '## Popup 조작 (도움말 / 답변)', '',
+        \ 'j/k, 방향키: 스크롤 | Ctrl-d/u, PageDown/Up: 반 페이지',
+        \ 'gg/G: 처음/끝 | Enter: Vim vertical split으로 펼치기',
+        \ 'q/Esc: popup 닫기 | 펼친 읽기 전용 split에서 q: 창 닫기',
+        \ '답변 popup을 닫아도 생성은 계속됩니다. 중단은 :' . name . 'PopStop입니다.', '',
+        \ '## Pane 선택 / 포커스', '',
+        \ 'let g:codex_pane_backend = ''tmux''  " tmux pane, tmux 밖에서는 Vim split',
+        \ 'let g:codex_pane_backend = ''vim''   " 항상 Vim vertical split',
+        \ 'tmux pane 생성에 실패해도 Vim split으로 전환합니다.',
+        \ 'Popup의 Enter 확장은 이 설정과 관계없이 Vim vertical split입니다.',
+        \ 'Vim terminal에서 나가기: Ctrl-w N, 이후 Ctrl-w h로 왼쪽 창 이동',
+        \ 'tmux 창 이동: tmux prefix + o (기본 Ctrl-b o), 또는 prefix + 방향키', '',
+        \ '## 컨텍스트 / 편집', '',
+        \ '마지막으로 포커스한 소스 버퍼를 사용합니다. 미저장/이름 없는 버퍼도 지원합니다.',
+        \ 'Visual 영역을 선택한 뒤 \ca / \cpa 또는 :''<,''>' . name . 'Ask 질문을 실행합니다.',
+        \ '선택 텍스트와 파일/버퍼 경로, 선택 범위, 커서 위치를 함께 전달합니다.',
+        \ '디스크에 없는 버퍼의 선택 영역에는 버퍼 전체 내용도 함께 전달합니다.',
+        \ '열린 파일은 버퍼에서 편집하고, 저장이 필요하면 현재 권한에 따라 저장/승인합니다.',
+        \ '새 파일과 열려 있지 않은 파일은 CLI의 일반 파일 도구와 권한을 따릅니다.'])
+  if s:provider ==# 'claude'
+    call extend(lines, ['', 'Claude의 열린 pane에 :ClaudeAsk로 보낼 때는 입력줄을 비워 둡니다.',
+          \ 'pane이 실행 중이거나 권한 확인 중이면 끝난 후 다시 질문합니다.'])
+  endif
+  return lines
+endfunction
+
+function! codex#Help(full) abort
+  let lines = s:HelpLines()
+  if s:help_popup > 0
+    call popup_close(s:help_popup)
+  endif
+  if a:full
+    call s:ExpandHelp(lines)
+    return
+  endif
+  let s:help_popup = popup_create(lines, {'pos': 'center',
+        \ 'title': ' ' . s:Name() . ' help | Enter: split  q/Esc: close ',
+        \ 'minwidth': min([70, max([20, &columns - 8])]), 'maxwidth': max([20, &columns - 8]),
+        \ 'maxheight': max([3, &lines * 2 / 3]), 'border': [], 'padding': [0, 1, 0, 1],
+        \ 'scrollbar': 1, 'mapping': 0, 'filter': function('s:HelpFilter'),
+        \ 'callback': function('s:HelpClosed')})
+  call setbufvar(winbufnr(s:help_popup), '&filetype', 'markdown')
+endfunction
+
+function! s:HelpClosed(id, result) abort
+  if s:help_popup == a:id
+    let s:help_popup = 0
+  endif
+endfunction
+
+function! s:HelpFilter(id, key) abort
+  if a:key ==# 'q' || a:key ==# "\<Esc>"
+    call popup_close(a:id)
+  elseif a:key ==# "\<CR>"
+    let lines = getbufline(winbufnr(a:id), 1, '$')
+    call popup_close(a:id)
+    call s:ExpandHelp(lines)
+  else
+    call s:ScrollPopup(a:id, a:key)
+  endif
+  return 1
+endfunction
+
+function! s:ExpandHelp(lines) abort
+  if s:help_buffer > 0 && bufexists(s:help_buffer)
+    let window = bufwinid(s:help_buffer)
+    if window != -1
+      call win_gotoid(window)
+    else
+      execute 'botright vertical sbuffer ' . s:help_buffer
+    endif
+  else
+    noautocmd botright vnew
+    let b:codex_ui = 1
+    setlocal buftype=nofile bufhidden=wipe noswapfile filetype=markdown
+    file vim-ai-help://commands
+    let s:help_buffer = bufnr('%')
+    nnoremap <silent><buffer> q :hide close<CR>
+  endif
+  call s:SetAnswerBuffer(s:help_buffer, join(a:lines, "\n"))
+endfunction
 
 function! s:Error(text) abort
   echohl ErrorMsg
-  echomsg '[codex] ' . a:text
+  echomsg '[' . s:provider . '] ' . a:text
   echohl None
 endfunction
 
@@ -209,7 +342,7 @@ function! codex#ShowContext(full, range, first, last) abort
     else
       let s:context_root = root
       let s:context_popup = popup_create(s:ContextLines(root, 0), {
-            \ 'pos': 'center', 'title': ' Codex context ', 'border': [], 'padding': [0, 1, 0, 1],
+            \ 'pos': 'center', 'title': ' ' . s:Name() . ' context ', 'border': [], 'padding': [0, 1, 0, 1],
             \ 'maxwidth': max([20, &columns - 8]), 'maxheight': max([3, &lines - 6]),
             \ 'scrollbar': 1, 'mapping': 0, 'filter': function('s:ContextFilter'),
             \ 'callback': function('s:ContextClosed')})
@@ -283,6 +416,11 @@ function! s:RouteInteractive(request) abort
     elseif state.popup > 0 && !empty(popup_getpos(state.popup))
       call popup_show(state.popup)
     endif
+  elseif get(state.message, 'defer_to_native', 0)
+    " Claude's hook has to return before its native prompt can appear.
+    call ch_sendraw(job_getchannel(s:job), json_encode({'op': 'interactive_reply',
+          \ 'request_id': a:request, 'decision': 'native'}) . "\n")
+    call s:DismissInteractive(a:request)
   elseif state.popup > 0 && !empty(popup_getpos(state.popup))
     " Hiding must not invoke the close callback or synthesize a rejection.
     call popup_hide(state.popup)
@@ -347,18 +485,20 @@ function! s:ShowInteractive(message) abort
   if has_key(a:message.params, 'permissions')
     let details .= ' ' . json_encode(a:message.params.permissions)
   endif
-  let popup = popup_menu(['Allow once', 'Allow for this session', 'Reject'], {
-        \ 'title': ' Codex permission: ' . substitute(details, '[\r\n]', ' ', 'g'),
+  let choices = get(a:message, 'allow_session', 1)
+        \ ? ['accept', 'acceptForSession', 'decline'] : ['accept', 'decline']
+  let labels = len(choices) == 3 ? ['Allow once', 'Allow for this session', 'Reject'] : ['Allow once', 'Reject']
+  let popup = popup_menu(labels, {
+        \ 'title': ' ' . s:Name() . ' permission: ' . substitute(details, '[\r\n]', ' ', 'g'),
         \ 'maxwidth': max([20, &columns - 8]),
-        \ 'callback': function('s:ApprovalChosen', [a:message.request_id])})
+        \ 'callback': function('s:ApprovalChosen', [a:message.request_id, choices])})
   if has_key(s:interactive, a:message.request_id)
     let s:interactive[a:message.request_id].popup = popup
   endif
 endfunction
 
-function! s:ApprovalChosen(request, id, index) abort
-  let choices = ['accept', 'acceptForSession', 'decline']
-  let decision = a:index >= 1 && a:index <= 3 ? choices[a:index - 1] : 'decline'
+function! s:ApprovalChosen(request, choices, id, index) abort
+  let decision = a:index >= 1 && a:index <= len(a:choices) ? a:choices[a:index - 1] : 'decline'
   call s:ReplyInteractive({'op': 'interactive_reply',
         \ 'request_id': a:request, 'decision': decision})
 endfunction
@@ -461,21 +601,29 @@ function! s:Start() abort
   if type(s:job) == v:t_job && job_status(s:job) ==# 'run'
     return
   endif
-  if !executable(g:codex_python) || !executable(g:codex_executable)
-    throw 'Install Python 3.11+ and Codex CLI, or configure their executable paths'
+  if index(['codex', 'claude'], s:provider) < 0
+    throw 'g:codex_provider must be codex or claude'
+  endif
+  let executable = s:provider ==# 'claude' ? g:claude_executable : g:codex_executable
+  if !executable(g:codex_python) || !executable(executable)
+    throw 'Install Python 3.9+ and ' . s:Name() . ' CLI, or configure their executable paths'
   endif
   let s:job = job_start([g:codex_python, s:script, 'host'], {
         \ 'in_mode': 'nl', 'out_mode': 'nl', 'err_mode': 'nl',
         \ 'out_cb': function('s:Output'), 'err_cb': function('s:Stderr'),
         \ 'exit_cb': function('s:Exited'), 'stoponexit': 'term'})
   if job_status(s:job) !=# 'run'
-    throw 'Could not start the Codex bridge'
+    throw 'Could not start the ' . s:Name() . ' bridge'
   endif
+  let s:started = 1
   call s:Send({'op': 'init', 'config': {'codex': exepath(g:codex_executable),
+        \ 'provider': s:provider, 'claude': exepath(g:claude_executable),
         \ 'python': exepath(g:codex_python), 'script': s:script,
-        \ 'state_dir': expand(g:codex_state_dir), 'model': g:codex_model,
+        \ 'state_dir': expand(g:codex_state_dir),
+        \ 'model': s:provider ==# 'claude' ? g:claude_model : g:codex_model,
+        \ 'permission_mode': g:claude_permission_mode,
         \ 'sandbox_mode': g:codex_sandbox_mode, 'approval_policy': g:codex_approval_policy,
-        \ 'extra_args': g:codex_extra_args}}, function('s:Ignore'))
+        \ 'extra_args': s:provider ==# 'claude' ? g:claude_extra_args : g:codex_extra_args}}, function('s:Ignore'))
 endfunction
 
 function! s:Ignore(result) abort
@@ -504,7 +652,7 @@ function! s:Exited(job, status) abort
       let s:interactive_timer = -1
     endif
     let s:pending = {}
-    call s:Error('Bridge exited (' . a:status . '); use :CodexStatus to inspect configuration')
+    call s:Error('Bridge exited (' . a:status . '); use :' . s:Name() . 'Status to inspect configuration')
   endif
 endfunction
 
@@ -559,7 +707,7 @@ function! codex#Command(op, mode, question, range, first, last) abort
       return
     endif
     if a:op ==# 'ask' && empty(question)
-      let question = input('Codex: ')
+      let question = input(s:Name() . ': ')
       if empty(question)
         return
       endif
@@ -573,7 +721,8 @@ function! codex#Command(op, mode, question, range, first, last) abort
     endif
     call s:Start()
     call s:Send({'op': a:op, 'mode': a:mode, 'root': context.root,
-          \ 'context': context, 'question': question}, Callback)
+          \ 'context': context, 'question': question,
+          \ 'pane_alive': s:PaneAlive(get(s:panes, context.root, {}))}, Callback)
   catch
     call s:Error(v:exception)
   endtry
@@ -668,20 +817,80 @@ function! s:DestroyPane(root) abort
   endif
 endfunction
 
+function! s:PaneAlive(pane) abort
+  if s:OwnTmux(a:pane)
+    let dead = trim(s:System(['tmux', 'display-message', '-p', '-t', a:pane.tmux, '#{pane_dead}']))
+    return !v:shell_error && dead ==# '0'
+  endif
+  return has_key(a:pane, 'buffer') && bufexists(a:pane.buffer)
+        \ && getbufvar(a:pane.buffer, '&buftype') ==# 'terminal'
+        \ && job_status(term_getjob(a:pane.buffer)) ==# 'run'
+endfunction
+
+function! s:PasteQuestion(root, pane, result) abort
+  if empty(get(a:result, 'paste_text', ''))
+    return
+  endif
+  try
+    if s:OwnTmux(a:pane)
+      let name = 'vim-claude-' . s:instance
+      call s:System(['tmux', 'load-buffer', '-b', name, a:result.paste_path])
+      if v:shell_error
+        throw 'Could not load the question into tmux'
+      endif
+      call s:System(['tmux', 'paste-buffer', '-p', '-d', '-b', name, '-t', a:pane.tmux])
+      if v:shell_error
+        throw 'Could not paste the question into Claude'
+      endif
+    else
+      call term_sendkeys(a:pane.buffer, "\e[200~" . a:result.paste_text . "\e[201~")
+    endif
+    " Allow the CLI to finish processing the paste before submitting it.
+    call timer_start(300, function('s:SubmitQuestion', [a:root, a:pane]))
+  catch
+    call s:PaneAskFailed(a:root, v:exception)
+  endtry
+endfunction
+
+function! s:PaneAskFailed(root, reason) abort
+  call s:Error(a:reason)
+  call s:Send({'op': 'pane_ask_failed', 'mode': 'pane', 'root': a:root}, function('s:Ignore'))
+endfunction
+
+function! s:SubmitQuestion(root, pane, timer) abort
+  if s:closing
+    return
+  endif
+  if get(get(s:panes, a:root, {}), 'thread_id', '') !=# a:pane.thread_id || !s:PaneAlive(a:pane)
+    call s:PaneAskFailed(a:root, 'Claude pane closed before the question was submitted')
+    return
+  endif
+  if s:OwnTmux(a:pane)
+    call s:System(['tmux', 'send-keys', '-t', a:pane.tmux, 'Enter'])
+    if v:shell_error
+      call s:PaneAskFailed(a:root, 'Could not submit the question to Claude')
+    endif
+  else
+    call term_sendkeys(a:pane.buffer, "\r")
+  endif
+endfunction
+
 function! s:OpenPane(root, result) abort
   let pane = get(s:panes, a:root, {})
   if get(pane, 'thread_id', '') ==# a:result.thread_id
-    if s:OwnTmux(pane)
+    if s:OwnTmux(pane) && s:PaneAlive(pane)
       call s:RefreshContext(-1)
       call s:System(['tmux', 'select-pane', '-t', pane.tmux])
+      call s:PasteQuestion(a:root, pane, a:result)
       return
-    elseif has_key(pane, 'buffer') && bufexists(pane.buffer) && job_status(term_getjob(pane.buffer)) ==# 'run'
+    elseif s:PaneAlive(pane)
       let window = bufwinid(pane.buffer)
       if window != -1
         call win_gotoid(window)
       else
         execute 'botright vertical sbuffer ' . pane.buffer
       endif
+      call s:PasteQuestion(a:root, pane, a:result)
       return
     endif
   endif
@@ -698,16 +907,16 @@ function! s:OpenPane(root, result) abort
       call s:RefreshContext(-1)
       return
     endif
-    echomsg '[codex] tmux pane failed; opening Vim split: ' . trim(output)
+    echomsg '[' . s:provider . '] tmux pane failed; opening Vim split: ' . trim(output)
   endif
   let source = get(s:source_buffers, a:root, s:last_buffer)
   noautocmd botright vnew
   let b:codex_ui = 1
   let pane.buffer = term_start(a:result.argv, {'curwin': 1, 'cwd': a:root,
-        \ 'term_name': 'codex://' . a:result.thread_id, 'term_finish': 'close'})
+        \ 'term_name': s:provider . '://' . a:result.thread_id, 'term_finish': 'close'})
   if pane.buffer <= 0
     close
-    call s:Error('Could not open the Codex terminal')
+    call s:Error('Could not open the ' . s:Name() . ' terminal')
     return
   endif
   let b:codex_ui = 1
@@ -715,7 +924,7 @@ function! s:OpenPane(root, result) abort
   let s:source_buffers[a:root] = source
   let s:last_buffer = source
   call filter(s:source_history, 'v:val != pane.buffer')
-  let &l:statusline = '[Codex] %{codex#PaneStatusline()}'
+  let &l:statusline = '[' . s:Name() . '] %{codex#PaneStatusline()}'
   let s:panes[a:root] = pane
   call s:RefreshContext(-1)
   startinsert
@@ -751,12 +960,12 @@ endfunction
 
 function! s:SessionList(root, mode, sessions) abort
   if empty(a:sessions)
-    echomsg '[codex] No ' . a:mode . ' sessions for ' . a:root
+    echomsg '[' . s:provider . '] No ' . a:mode . ' sessions for ' . a:root
     return
   endif
   let labels = map(copy(a:sessions),
         \ 'strftime("%m-%d %H:%M", float2nr(v:val.updated)) . "  [" . get(v:val, "source", "Vim") . "] " . (empty(v:val.title) ? "[New conversation]" : v:val.title) . "  " . strpart(v:val.id, 0, 8)')
-  call popup_menu(labels, {'title': ' Codex ' . a:mode . ' sessions ',
+  call popup_menu(labels, {'title': ' ' . s:Name() . ' ' . a:mode . ' sessions ',
         \ 'maxwidth': max([30, &columns - 8]), 'maxheight': max([3, &lines - 8]),
         \ 'callback': function('s:SessionChosen', [a:root, a:mode, a:sessions])})
 endfunction
@@ -768,6 +977,7 @@ function! s:SessionChosen(root, mode, sessions, id, index) abort
   let Callback = a:mode ==# 'pane' ? function('s:OpenPane', [a:root])
         \ : function('s:PopupSelected', [a:root, 'select'])
   call s:Send({'op': 'select', 'mode': a:mode, 'root': a:root,
+        \ 'pane_alive': s:PaneAlive(get(s:panes, a:root, {})),
         \ 'thread_id': a:sessions[a:index - 1].id}, Callback)
 endfunction
 
@@ -779,7 +989,7 @@ function! s:PopupSelected(root, op, result) abort
     endif
     let s:popups[a:root] = {'id': 0, 'text': '', 'hidden': 1,
           \ 'thread_id': a:result.thread_id, 'busy': 0}
-    echomsg '[codex] Popup session selected: ' . a:result.thread_id
+    echomsg '[' . s:provider . '] Popup session selected: ' . a:result.thread_id
   endif
 endfunction
 
@@ -790,7 +1000,7 @@ function! s:Answer(message) abort
     if get(old, 'id', 0) > 0
       call popup_close(old.id)
     endif
-    let s:popups[root] = {'id': 0, 'text': 'Waiting for Codex…', 'hidden': 0,
+    let s:popups[root] = {'id': 0, 'text': 'Waiting for ' . s:Name() . '…', 'hidden': 0,
           \ 'thread_id': a:message.thread_id, 'busy': 1, 'context': get(a:message, 'context', {})}
   elseif index(['answer', 'answer_done'], a:message.event) >= 0
     let state = get(s:popups, root, {})
@@ -827,9 +1037,9 @@ function! s:ShowPopup(root) abort
   if empty(text)
     let text = ['']
   endif
-  let title = ' Codex' . (state.busy ? ' · working' : '') . ' | Enter: expand  q/Esc: close '
+  let title = ' ' . s:Name() . (state.busy ? ' · working' : '') . ' | Enter: expand  q/Esc: close '
   if !empty(get(state, 'context', {}))
-    let title = ' Codex' . (state.busy ? ' · working' : '') . ' | ' . codex#ContextSummary(state.context) . ' '
+    let title = ' ' . s:Name() . (state.busy ? ' · working' : '') . ' | ' . codex#ContextSummary(state.context) . ' '
   endif
   if state.id > 0 && !empty(popup_getpos(state.id))
     call popup_settext(state.id, text)
@@ -858,24 +1068,28 @@ function! s:PopupFilter(root, id, key) abort
   elseif a:key ==# "\<CR>"
     call s:ExpandAnswer(a:root)
   else
-    let pos = popup_getpos(a:id)
-    let first = pos.firstline
-    if a:key ==# 'j' || a:key ==# "\<Down>"
-      let first += 1
-    elseif a:key ==# 'k' || a:key ==# "\<Up>"
-      let first -= 1
-    elseif a:key ==# "\<C-d>" || a:key ==# "\<PageDown>"
-      let first += max([1, pos.core_height / 2])
-    elseif a:key ==# "\<C-u>" || a:key ==# "\<PageUp>"
-      let first -= max([1, pos.core_height / 2])
-    elseif a:key ==# 'g'
-      let first = 1
-    elseif a:key ==# 'G'
-      let first = len(split(s:popups[a:root].text, "\n", 1)) - pos.core_height + 1
-    endif
-    call popup_setoptions(a:id, {'firstline': max([1, first])})
+    call s:ScrollPopup(a:id, a:key)
   endif
   return 1
+endfunction
+
+function! s:ScrollPopup(id, key) abort
+  let pos = popup_getpos(a:id)
+  let first = pos.firstline
+  if a:key ==# 'j' || a:key ==# "\<Down>"
+    let first += 1
+  elseif a:key ==# 'k' || a:key ==# "\<Up>"
+    let first -= 1
+  elseif a:key ==# "\<C-d>" || a:key ==# "\<PageDown>"
+    let first += max([1, pos.core_height / 2])
+  elseif a:key ==# "\<C-u>" || a:key ==# "\<PageUp>"
+    let first -= max([1, pos.core_height / 2])
+  elseif a:key ==# 'g'
+    let first = 1
+  elseif a:key ==# 'G'
+    let first = len(getbufline(winbufnr(a:id), 1, '$')) - pos.core_height + 1
+  endif
+  call popup_setoptions(a:id, {'firstline': max([1, first])})
 endfunction
 
 function! s:SetAnswerBuffer(nr, text) abort
@@ -901,7 +1115,7 @@ function! s:ExpandAnswer(root) abort
     noautocmd botright vnew
     let b:codex_ui = 1
     setlocal buftype=nofile bufhidden=hide noswapfile filetype=markdown
-    execute 'file codex-answer://' . state.thread_id
+    execute 'file ' . s:provider . '-answer://' . state.thread_id
     let state.answer_buffer = bufnr('%')
     nnoremap <silent><buffer> q :hide close<CR>
   endif
@@ -916,7 +1130,7 @@ function! s:Target(arguments, root) abort
   if has_key(a:arguments, 'buffer_id')
     let nr = a:arguments.buffer_id
     if !bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
-      throw 'File is not open in a source buffer; use normal Codex file tools under current permissions'
+      throw 'File is not open in a source buffer; use normal ' . s:Name() . ' file tools under current permissions'
     endif
     let path = empty(bufname(nr)) ? '' : resolve(fnamemodify(bufname(nr), ':p'))
     if empty(path) && g:codex_access_scope ==# 'project'
@@ -943,7 +1157,7 @@ function! s:Target(arguments, root) abort
       endif
     endfor
     if nr < 0
-      throw 'File is not open in Vim; use normal Codex file tools under current permissions'
+      throw 'File is not open in Vim; use normal ' . s:Name() . ' file tools under current permissions'
     endif
   else
     let nr = get(s:source_buffers, a:root, -1)
@@ -953,7 +1167,7 @@ function! s:Target(arguments, root) abort
     return s:Target({'buffer_id': nr}, a:root)
   endif
   if !bufloaded(nr) || getbufvar(nr, '&buftype') !=# '' || getbufvar(nr, 'codex_ui', 0)
-    throw 'File is not open in a source buffer; use normal Codex file tools under current permissions'
+    throw 'File is not open in a source buffer; use normal ' . s:Name() . ' file tools under current permissions'
   endif
   call setbufvar(nr, 'codex_root', a:root)
   return nr
@@ -1047,7 +1261,7 @@ function! s:SaveBuffer(nr, args) abort
   if !result.saved
     let result.message = 'Write completed, but a write hook left new unsaved changes; re-read before validation'
   endif
-  echomsg '[codex] Saved buffer: ' . info.path
+  echomsg '[' . s:provider . '] Saved buffer: ' . info.path
   return result
 endfunction
 
@@ -1165,7 +1379,7 @@ function! codex#BufferRequest(operation, arguments, root) abort
   if index(s:changes[a:root], nr) < 0
     call add(s:changes[a:root], nr)
   endif
-  echomsg '[codex] Modified buffer: ' . (empty(bufname(nr)) ? '[No Name] #' . nr : bufname(nr))
+  echomsg '[' . s:provider . '] Modified buffer: ' . (empty(bufname(nr)) ? '[No Name] #' . nr : bufname(nr))
   return s:BufferInfo(nr)
 endfunction
 
@@ -1188,11 +1402,11 @@ function! codex#Changes() abort
     let root = codex#Context(0, 0, 0).root
     let buffers = filter(copy(get(s:changes, root, [])), 'bufexists(v:val)')
     if empty(buffers)
-      echomsg '[codex] No changed buffers in this Vim instance'
+      echomsg '[' . s:provider . '] No changed buffers in this Vim instance'
       return
     endif
     call popup_menu(map(copy(buffers), '(getbufvar(v:val, "&modified") ? "+ " : "  ") . (empty(bufname(v:val)) ? "[No Name] #" . v:val : bufname(v:val))'),
-          \ {'title': ' Codex changed buffers ', 'callback': function('s:ChangeChosen', [buffers])})
+          \ {'title': ' ' . s:Name() . ' changed buffers ', 'callback': function('s:ChangeChosen', [buffers])})
   catch
     call s:Error(v:exception)
   endtry
@@ -1205,15 +1419,21 @@ function! s:ChangeChosen(buffers, id, index) abort
 endfunction
 
 function! codex#Status() abort
-  echomsg '[codex] backend=' . g:codex_pane_backend . ' codex=' . g:codex_executable
-        \ . ' python=' . g:codex_python . ' state=' . expand(g:codex_state_dir)
+  echomsg '[' . s:provider . '] backend=' . g:codex_pane_backend . ' executable='
+        \ . (s:provider ==# 'claude' ? g:claude_executable : g:codex_executable)
+        \ . ' python=' . g:codex_python . ' state=' . expand(g:codex_state_dir) . (s:provider ==# 'claude' ? '/claude' : '')
         \ . ' bridge=' . (type(s:job) == v:t_job ? job_status(s:job) : 'not started')
-        \ . ' access=' . g:codex_access_scope . ' sandbox_override=' . (empty(g:codex_sandbox_mode) ? 'inherit' : g:codex_sandbox_mode)
-        \ . ' approval_override=' . (empty(g:codex_approval_policy) ? 'inherit' : g:codex_approval_policy)
+        \ . ' access=' . g:codex_access_scope
+  if s:provider ==# 'claude'
+    echomsg '[claude] permission_mode_override=' . (empty(g:claude_permission_mode) ? 'inherit' : g:claude_permission_mode)
+  else
+    echomsg '[codex] sandbox_override=' . (empty(g:codex_sandbox_mode) ? 'inherit' : g:codex_sandbox_mode)
+          \ . ' approval_override=' . (empty(g:codex_approval_policy) ? 'inherit' : g:codex_approval_policy)
+  endif
   try
     call codex#Track()
     let path = empty(bufname(s:last_buffer)) ? '' : fnamemodify(bufname(s:last_buffer), ':p')
-    echomsg '[codex] Context ready: ' . codex#ContextSummary(codex#BufferRequest('editor_context', {}, s:Root(path)))
+    echomsg '[' . s:provider . '] Context ready: ' . codex#ContextSummary(codex#BufferRequest('editor_context', {}, s:Root(path)))
   catch
   endtry
 endfunction

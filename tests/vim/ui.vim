@@ -1,6 +1,8 @@
 set nocompatible
 set nomore
 set rtp^=.
+source tests/vim/helpers.vim
+let g:codex_python = empty($VIM_CODEX_TEST_PYTHON) ? 'python3' : $VIM_CODEX_TEST_PYTHON
 let g:codex_executable = getcwd() . '/tests/fake_codex.py'
 let g:codex_state_dir = tempname()
 let g:codex_pane_backend = get(g:, 'codex_test_backend', 'vim')
@@ -18,12 +20,12 @@ function! WaitFor(expression) abort
 endfunction
 
 function! PopupText() abort
-  let ids = popup_list()
+  let ids = PopupList()
   return empty(ids) ? '' : join(getbufline(winbufnr(ids[0]), 1, '$'), "\n")
 endfunction
 
 function! PermissionVisible() abort
-  for id in popup_list()
+  for id in PopupList()
     if get(popup_getpos(id), 'visible', 0) && index(getbufline(winbufnr(id), 1, '$'), 'Allow once') >= 0
       return 1
     endif
@@ -43,10 +45,10 @@ hide close
 
 CodexPopAsk LONG_ANSWER
 call WaitFor('PopupText() =~# "Answer line 100"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
-call assert_true(popup_getoptions(popup_list()[0]).title =~# '\[No Name\]')
-call assert_true(popup_getoptions(popup_list()[0]).title =~# '\[+\]')
-let s:popup = popup_list()[0]
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
+call assert_true(popup_getoptions(PopupList()[0]).title =~# '\[No Name\]')
+call assert_true(popup_getoptions(PopupList()[0]).title =~# '\[+\]')
+let s:popup = PopupList()[0]
 call assert_equal(s:source, bufnr('%'))
 call feedkeys('G', 'xt')
 call assert_true(popup_getpos(s:popup).firstline > 1)
@@ -63,7 +65,7 @@ hide close
 CodexPopReopen
 call WaitFor('PopupText() =~# "Answer line 100"')
 call feedkeys('q', 'xt')
-call assert_equal([], popup_list())
+call assert_equal([], PopupList())
 
 CodexContext!
 call assert_true(join(getline(1, '$'), "\n") =~# 'Context payload (popup)')
@@ -73,7 +75,7 @@ hide close
 " Real job/channel -> app-server -> MCP subprocess -> Vim edit -> streamed answer.
 CodexPopAsk EDIT_BUFFER
 call WaitFor('PopupText() =~# "Modified buffer"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
 call assert_equal('edited by Codex fixture', getbufline(s:source, 1)[0])
 call assert_true(getbufvar(s:source, '&modified'))
 call feedkeys("\<Esc>", 'xt')
@@ -93,7 +95,7 @@ CodexPopAsk REQUEST_APPROVAL
 call WaitFor('PermissionVisible()')
 call feedkeys("\<CR>", 'xt')
 call WaitFor('PopupText() =~# "Permission accepted"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
 call feedkeys('q', 'xt')
 
 " A native answer closes the outstanding Vim popup without declining it.
@@ -101,7 +103,7 @@ CodexPopAsk NATIVE_RESOLVE
 call WaitFor('PermissionVisible()')
 call WaitFor('!PermissionVisible()')
 call WaitFor('PopupText() =~# "Permission accepted"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
 call feedkeys('q', 'xt')
 
 " Existing hidden buffers save through MCP only when current permissions allow.
@@ -112,7 +114,7 @@ let s:save_nr = bufadd(s:save_path)
 call bufload(s:save_nr)
 execute 'CodexPopAsk SAVE_BUFFER buffer=' . s:save_nr
 call WaitFor('PopupText() =~# "Saved for validation"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
 call assert_equal(['saved by fixture'], readfile(s:save_path))
 call assert_false(getbufvar(s:save_nr, '&modified'))
 call assert_equal(s:source, bufnr('%'))
@@ -123,7 +125,7 @@ execute 'CodexPopAsk SAVE_CONFIRM buffer=' . s:save_nr
 call WaitFor('PermissionVisible()')
 call feedkeys("\<Esc>", 'xt')
 call WaitFor('PopupText() =~# "save declined"')
-call WaitFor('popup_getoptions(popup_list()[0]).title !~# "working"')
+call WaitFor('popup_getoptions(PopupList()[0]).title !~# "working"')
 call assert_equal(['saved by fixture'], readfile(s:save_path))
 call assert_true(getbufvar(s:save_nr, '&modified'))
 call assert_false(PopupText() =~# 'Saved for validation')
@@ -132,10 +134,10 @@ execute 'bwipeout! ' . s:save_nr
 call delete(s:save_path)
 
 CodexPopResume
-call WaitFor('!empty(popup_list())')
+call WaitFor('!empty(PopupList())')
 call feedkeys("\<CR>", 'xt')
 sleep 200m
-call assert_equal([], popup_list())
+call assert_equal([], PopupList())
 CodexPopNew
 sleep 200m
 

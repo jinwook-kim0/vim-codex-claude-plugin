@@ -1,12 +1,86 @@
-# vim-codex
+# vim-codex-claude
 
-터미널 Vim에서 Codex CLI pane과 답변 popup을 사용합니다. 저장하지 않은
+터미널 Vim에서 Codex 또는 Claude Code CLI pane과 답변 popup을 사용합니다. 저장하지 않은
 수정과 이름 없는 버퍼도 컨텍스트로 전달합니다. 열린 파일은 버퍼에서 편집하고,
-새 파일과 열려 있지 않은 파일은 Codex가 현재 권한에 따라 직접 처리합니다.
+새 파일과 열려 있지 않은 파일은 선택한 CLI가 현재 권한에 따라 직접 처리합니다.
 
-Linux, Vim 9.1 (`+terminal +popupwin +job +channel`), Python 3.11 이상,
-Codex CLI 0.166.0을 기준으로 구현했습니다. Python 외부 패키지와 fzf는 필요하지
-않습니다. tmux는 선택 사항입니다. Codex 로그인은 기존 `codex login` 설정을 사용합니다.
+Linux, Vim 8.2 이상 (`+terminal +popupwin +job +channel`), Python 3.9 이상을
+지원합니다. Python은 외부 프로세스로 실행하므로 Vim의 `+python3`나 Python 외부
+패키지는 필요하지 않습니다. fzf와 tmux도 필수가 아닙니다. Codex 또는 Claude Code
+CLI를 설치하고 평소처럼 로그인한 환경을 사용합니다. Claude는 2.x CLI를 대상으로 하며,
+2.1.322에서 모델 요청 없는 실제 연결을 검증했습니다.
+
+## Claude Code 사용
+
+회사 환경의 `.vimrc`에는 플러그인을 불러오기 전에 다음을 설정합니다.
+
+```vim
+let g:codex_provider = 'claude'
+let g:codex_python = 'python3.9'  " 3.9 이상이면 python3 또는 절대 경로도 가능
+let g:claude_executable = 'claude'
+let g:codex_pane_backend = 'tmux' " tmux 밖에서는 Vim vertical split으로 전환
+```
+
+Vim을 다시 시작한 뒤 `:Claude`로 pane을 열거나,
+`:ClaudePopAsk 이 코드를 설명해줘`로 답변 popup을 띄웁니다.
+`\ca`는 선택한 CLI의 pane 질문, `\cpa`는 popup 질문 입력줄입니다.
+`\ch`는 명령어·단축키 도움말 popup입니다. Enter로 Vim vertical split에 펼치고
+q/Esc로 닫습니다. 도움말에서도 답변 popup과 같은 스크롤 키를 사용합니다.
+영역을 선택하고 실행하면 선택한 텍스트·파일/버퍼 위치·커서를 함께 전달합니다.
+Popup은 스크롤할 수 있고 Enter로 읽기 전용 split에 펼치며 q/Esc로 닫습니다.
+
+| Claude 명령 | 동작 |
+|---|---|
+| `:Claude`, `:ClaudeAsk {질문}` | native CLI pane 열기 / 컨텍스트와 질문 전달 |
+| `:ClaudeResume` | 현재 프로젝트의 기존 Claude 터미널 세션을 포함해 선택 후 열기 |
+| `:ClaudeNew`, `:ClaudeHide` | 새 pane 대화 / pane 숨기기·닫기 |
+| `:ClaudePopAsk {질문}` | pane과 독립된 대화에 질문, 답변을 popup으로 스트리밍 |
+| `:ClaudePopResume`, `:ClaudePopNew` | 이전 popup 대화 선택 / 새 popup 대화 선택 |
+| `:ClaudePopReopen`, `:ClaudePopStop` | 마지막 답변 다시 열기 / 응답 생성 중단 |
+| `:ClaudeChanges`, `:ClaudeStatus` | 변경한 버퍼 목록 / 설정·연결 상태 |
+| `:ClaudeContext`, `:ClaudeContext!` | 컨텍스트 미리보기 / 마지막 제공한 본문 |
+| `:ClaudeHelp`, `:ClaudeHelp!` | 명령어·단축키 도움말 popup / Vim vertical split |
+
+한 Vim 프로세스는 한 CLI를 사용합니다. 기본값은 `g:codex_provider = 'codex'`이며,
+연결하기 전에 `:Claude...` 또는 `:Codex...` 명령으로 선택할 수도 있습니다.
+연결을 시작한 후 다른 CLI를 쓰려면 Vim을 다시 시작합니다. 두 CLI의 세션 저장소는
+분리되어 있고, Claude 안에서도 pane과 popup 세션을 분리합니다.
+Claude 사용자·프로젝트·조직 설정, 인증, skills, 기존 MCP 설정을 그대로 사용합니다.
+`CLAUDE_CONFIG_DIR`와 사내 endpoint 환경변수도 Vim에서 tmux pane으로 전달합니다.
+
+Claude 모델·권한 모드는 기본적으로 CLI 설정을 따릅니다. 필요한 경우에만 설정합니다.
+
+```vim
+let g:claude_model = ''            " 예: 'sonnet'; 빈 문자열은 CLI 기본값
+let g:claude_permission_mode = ''  " 예: 'default', 'acceptEdits', 'plan'
+let g:claude_extra_args = []
+```
+
+열린 파일은 `read_buffer`/`edit_buffer`로 현재 버퍼를 편집하고 바로 저장하지 않습니다.
+검증 등에 저장이 필요하면 `save_buffer`를 호출합니다. Claude의 현재 MCP 도구 권한이
+허용하면 저장하고, 승인이 필요하면 CLI가 확인을 요청합니다. `edit_buffer` 허용과
+`save_buffer` 허용은 별개입니다. 저장 직전 변경 번호·디스크 충돌을 다시 확인하고
+Vim의 정상 `:write`를 사용합니다. 새 파일과 열려 있지 않은 파일은 일반 Claude 도구로
+처리하며 Vim 버퍼로 자동 로드하지 않습니다.
+
+Pane의 직접 질문에도 UserPromptSubmit hook이 최신 Vim 컨텍스트를 제공합니다.
+Vim의 `:ClaudeAsk`는 질문 시점의 선택 영역을 전달합니다. 실행 중이거나 권한 확인 중인
+pane에는 질문을 끼워 넣지 않으며, 응답이 끝난 후 다시 실행해야 합니다.
+열린 pane으로 보낼 때는 bracketed paste 후 제출하므로 Claude 입력줄을 비워 둡니다.
+대화 전환은 `:ClaudeNew`/`:ClaudeResume`을 사용합니다. native `/clear`·`/resume`으로
+직접 바꾼 세션은 플러그인의 선택 상태와 동기화하지 않습니다.
+
+tmux에서 Vim에 포커스가 있으면 Claude의 PermissionRequest hook을 Vim popup으로
+표시하고, Claude pane에 포커스가 있으면 native 확인창으로 넘깁니다. Vim 확인창에서
+대기 중 Claude pane으로 이동해도 native 확인창으로 넘깁니다. 이미 native 확인창으로
+넘긴 요청을 다시 Vim에 복제하지는 않습니다. Popup 대화의 권한 요청과 사용자 질문은
+Vim에서 처리합니다. q/Esc로 승인창을 닫으면 거절합니다.
+Claude의 `/ide` 탐색 프로토콜 대신 MCP와 hook으로 같은 버퍼 컨텍스트를 전달합니다.
+
+연동에는 [Claude CLI 옵션](https://code.claude.com/docs/en/cli-reference),
+[hook 프로토콜](https://code.claude.com/docs/en/hooks),
+[공식 SDK의 stdio 제어 프로토콜](https://github.com/anthropics/claude-agent-sdk-python/tree/main/src/claude_agent_sdk/_internal)을
+사용합니다. SDK 패키지를 설치할 필요는 없습니다.
 
 ## 설치
 
@@ -52,10 +126,11 @@ Visual 모드에서 영역을 선택한 뒤 `:`를 누르고 `CodexAsk` 또는
 | `:CodexStatus` | 실행 파일, pane 설정, bridge 상태 표시 |
 | `:CodexContext` | 현재 파일·선택 범위·미저장 상태와 마지막 전달 내역 확인 |
 | `:CodexContext!` | 실제 제공했던 컨텍스트 본문을 읽기 전용 split으로 확인 |
+| `:CodexHelp`, `:CodexHelp!` | 명령어·단축키 도움말 popup / Vim vertical split |
 
 Vim 명령 이름 규칙에 따라 대문자로 시작하고 하이픈을 사용하지 않습니다.
-일반 모드와 Visual 모드 모두 `\ca`는 `CodexAsk`, `\cpa`는
-`CodexPopAsk`의 질문 입력줄을 엽니다. 이 바인딩의 `\`는 `mapleader` 설정과
+일반 모드와 Visual 모드 모두 `\ca`는 선택한 CLI의 pane 질문, `\cpa`는
+popup 질문 입력줄을 엽니다. 이 바인딩의 `\`는 `mapleader` 설정과
 관계없는 실제 백슬래시 키입니다. 다른 키를 추가하려면 다음과 같이 설정합니다.
 
 ```vim
@@ -63,6 +138,11 @@ nmap <leader>ca <Plug>(CodexAsk)
 xmap <leader>ca <Plug>(CodexAsk)
 nmap <leader>cpa <Plug>(CodexPopAsk)
 xmap <leader>cpa <Plug>(CodexPopAsk)
+" Claude를 명시적으로 선택하는 매핑:
+nmap <leader>cla <Plug>(ClaudeAsk)
+xmap <leader>cla <Plug>(ClaudeAsk)
+nmap <leader>clpa <Plug>(ClaudePopAsk)
+xmap <leader>clpa <Plug>(ClaudePopAsk)
 ```
 
 Popup은 `j/k`, 방향키, `Ctrl-d/u`, `PageDown/Up`, `gg/G`로 스크롤합니다.
@@ -234,8 +314,12 @@ Codex 자체의 권한과 승인 처리를 그대로 따릅니다.
 make test          # Python 프로토콜·세션 검사, headless Vim의 버퍼·UI 통합 검사
 make test-tmux     # 별도 tmux 서버에서 pane 생성·재사용·닫기 검사
 make test-native   # 실제 Codex app-server/MCP/CLI /ide 검사, 모델 질문은 전송하지 않음
+make test-claude-native # 실제 Claude CLI 초기 연결·skill 탐색, 모델 질문은 전송하지 않음
+
+# 별도 Python/Vim 설치로 최소 환경 검증
+make test test-tmux PYTHON=/path/to/python3.9 VIM_BIN=/path/to/vim8.2
 ```
 
-일반 테스트는 로컬 Codex 대역을 사용합니다. 대역의 응답 생성 과정에서도 실제
+일반 테스트는 로컬 Codex·Claude 대역을 사용합니다. 대역의 응답 생성 과정에서도 실제
 MCP subprocess와 Vim channel을 거쳐 미저장 버퍼 수정까지 검증합니다.
 실제 모델이 수정 도구를 선택하고 답변하는 과정은 자동 테스트에 포함하지 않습니다.

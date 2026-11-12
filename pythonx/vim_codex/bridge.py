@@ -200,10 +200,8 @@ class BufferHandler(socketserver.StreamRequestHandler):
             data = json.loads(self.rfile.readline(8 * 1024 * 1024))
             if not secrets.compare_digest(str(data.get('token', '')), self.server.host.token):
                 raise ValueError('Invalid Vim connection token')
-            if data['operation'] == 'save_buffer':
-                reply = self.server.host.save_buffer(data.get('arguments', {}), data['root'], data.get('session_key'))
-            else:
-                reply = self.server.host.buffer_request(data['operation'], data.get('arguments', {}), data['root'])
+            reply = self.server.host.tool_request(data['operation'], data.get('arguments', {}),
+                                                  data['root'], data.get('session_key'))
             value = {'result': reply}
         except Exception as error:
             value = {'error': str(error)}
@@ -278,6 +276,10 @@ class Host:
         self.buffer_server = ThreadingTCPServer(('127.0.0.1', 0), BufferHandler)
         self.buffer_server.host = self
         threading.Thread(target=self.buffer_server.serve_forever, daemon=True).start()
+        self.client_home = None
+        self.ide_server = None
+        if config.get('provider', 'codex') != 'codex':
+            return
         self.client_home = Path(config['state_dir']) / 'clients' / self.runtime.name
         (self.client_home / 'ipc').mkdir(parents=True, mode=0o700)
         user_home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).expanduser().resolve()
@@ -318,6 +320,11 @@ class Host:
             if pending:
                 pending[1].update(message)
                 pending[0].set()
+
+    def tool_request(self, operation, arguments, root, session_key):
+        if operation == 'save_buffer':
+            return self.save_buffer(arguments, root, session_key)
+        return self.buffer_request(operation, arguments, root)
 
     def start_server(self):
         with self.server_lock:
@@ -755,10 +762,12 @@ class Host:
                 self.process.wait()
         self.buffer_server.shutdown()
         self.buffer_server.server_close()
-        self.ide_server.shutdown()
-        self.ide_server.server_close()
+        if self.ide_server:
+            self.ide_server.shutdown()
+            self.ide_server.server_close()
         shutil.rmtree(self.runtime, ignore_errors=True)
-        shutil.rmtree(self.client_home, ignore_errors=True)
+        if self.client_home:
+            shutil.rmtree(self.client_home, ignore_errors=True)
 
 
 def mcp_main():
@@ -775,7 +784,15 @@ def mcp_main():
         elif method == 'ping':
             response['result'] = {}
         elif method == 'tools/list':
-            response['result'] = {'tools': TOOLS}
+            tools = copy.deepcopy(TOOLS)
+            if os.environ.get('VIM_CODEX_PROVIDER') == 'claude':
+                for item in tools:
+                    item['description'] = item['description'].replace('Codex', 'Claude')
+                    if item['name'] == 'save_buffer':
+                        item['description'] = ('Save a named, already loaded Vim buffer when a next step '
+                            'needs it on disk. Claude authorizes this tool using its current MCP permissions. '
+                            'Rejects stale buffers or changed disk files. Wait for success before testing.')
+            response['result'] = {'tools': tools}
         elif method == 'tools/call':
             try:
                 params = message['params']
@@ -800,10 +817,19 @@ def mcp_main():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['host', 'mcp'])
+    parser.add_argument('command', choices=['host', 'mcp', 'claude-hook', 'claude-pane'])
+    parser.add_argument('path', nargs='?')
     args = parser.parse_args()
     if args.command == 'mcp':
         mcp_main()
+        return
+    if args.command == 'claude-hook':
+        from .claude import hook_main
+        hook_main()
+        return
+    if args.command == 'claude-pane':
+        from .claude import pane_main
+        pane_main(args.path)
         return
     lock = threading.Lock()
     def emit(value):
@@ -823,7 +849,12 @@ def main():
         for line in sys.stdin:
             message = json.loads(line)
             if message['op'] == 'init':
-                host = Host(message['config'], emit)
+                config = message['config']
+                if config.get('provider', 'codex') == 'claude':
+                    from .claude import ClaudeHost
+                    host = ClaudeHost(config, emit)
+                else:
+                    host = Host(config, emit)
                 emit({'id': message['id'], 'result': {'ready': True}})
             elif message['op'] == 'buffer_reply':
                 host.buffer_reply(message)
